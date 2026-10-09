@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Novinky.cz - Clean Reader + Neural TTS
 // @namespace    http://tampermonkey.net/
-// @version      3.2
+// @version      3.3
 // @description  Category browser, clean article reader and high-quality Czech neural TTS (Azure) with local fallback.
 // @author       You
 // @match        *://*.novinky.cz/*
@@ -28,11 +28,30 @@
   // 3) Tampermonkey icon -> this script -> "Nastavit Azure klíč a region".
   // The key is stored by Tampermonkey (GM_setValue), never in the script text.
   const TTS = {
-    voice: 'cs-CZ-VlastaNeural',          // or 'cs-CZ-AntoninNeural' (male)
+    voice: 'cs-CZ-VlastaNeural',          // default; changeable in the reader UI
     format: 'audio-24khz-96kbitrate-mono-mp3',
     chunkChars: 600,                       // size of one request (sentence-aligned)
-    rate: 1.0                              // playback speed
+    rate: 1.0,                             // default playback speed (changeable in UI)
+    freeLimit: 500000                      // Azure F0 free tier, characters / month
   };
+  const VOICES = { 'cs-CZ-VlastaNeural': 'Vlasta (žena)', 'cs-CZ-AntoninNeural': 'Antonín (muž)' };
+  const getVoice = () => GM_getValue('voice', TTS.voice);
+  const getRate = () => Number(GM_getValue('rate', TTS.rate)) || 1;
+
+  // Locally counted characters sent to Azure this calendar month (this browser only).
+  const monthKey = () => new Date().toISOString().slice(0, 7);
+  function getUsed() {
+    const u = GM_getValue('usage', null);
+    return u && u.month === monthKey() ? u.chars : 0;
+  }
+  function addUsed(n) {
+    GM_setValue('usage', { month: monthKey(), chars: getUsed() + n });
+    updateUsageLabel();
+  }
+  function updateUsageLabel() {
+    const el = document.getElementById('tm-usage-label');
+    if (el) el.textContent = `Využito ${getUsed().toLocaleString('cs-CZ')} / ${TTS.freeLimit.toLocaleString('cs-CZ')} znaků tento měsíc`;
+  }
   const getKey = () => GM_getValue('azureKey', '');
   const getRegion = () => GM_getValue('azureRegion', 'westeurope');
 
@@ -166,7 +185,7 @@
   function ssmlFor(text) {
     const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     return `<speak version="1.0" xml:lang="cs-CZ" xmlns="http://www.w3.org/2001/10/synthesis">` +
-      `<voice name="${TTS.voice}">${esc}</voice></speak>`;
+      `<voice name="${getVoice()}">${esc}</voice></speak>`;
   }
 
   // Returns a blob: URL with MP3 audio for one chunk of text.
@@ -186,6 +205,7 @@
         timeout: 30000,
         onload: r => {
           if (r.status !== 200) return reject(new Error(`HTTP ${r.status} (401/403 = špatný klíč nebo region)`));
+          addUsed(text.length);
           resolve(URL.createObjectURL(new Blob([r.response], { type: 'audio/mpeg' })));
         },
         onerror: e => reject(new Error('síťová chyba / blokováno (' + ((e && e.error) || 'povolte připojení v Tampermonkey') + ')')),
@@ -197,7 +217,7 @@
   function playUrl(url, session) {
     return new Promise((resolve, reject) => {
       const a = new Audio(url);
-      a.playbackRate = TTS.rate;
+      a.playbackRate = getRate();
       a.preservesPitch = true;
       audioElement = a;
       a.onended = () => resolve();
@@ -570,8 +590,17 @@
             <span class="tm-speech-icon">▶</span>
             <span class="tm-speech-label">Přečíst článek</span>
           </button>
+          <select id="tm-voice-select" class="tm-voice-select" title="Hlas">
+            ${Object.entries(VOICES).map(([id, name]) => `<option value="${id}"${id === getVoice() ? ' selected' : ''}>${name}</option>`).join('')}
+          </select>
+          <label class="tm-rate-wrap" title="Rychlost">
+            <input id="tm-rate-range" type="range" min="0.7" max="1.6" step="0.05" value="${getRate()}">
+            <span id="tm-rate-label">${getRate().toFixed(2)}×</span>
+          </label>
           <span id="tm-tts-mode-label" class="tm-tts-mode-label">${getKey() ? 'Neurální hlas (Azure)' : 'Lokální TTS (chybí Azure klíč)'}</span>
         </div>
+
+        <div id="tm-usage-label" class="tm-tts-mode-label"></div>
 
         ${article.perexText ? `<div class="tm-perex">${escapeHTML(article.perexText)}</div>` : ''}
 
@@ -594,6 +623,14 @@
       // prefer external if enabled
       toggleSpeechUnified(speechText);
     });
+    document.getElementById('tm-voice-select').addEventListener('change', e => GM_setValue('voice', e.target.value));
+    document.getElementById('tm-rate-range').addEventListener('input', e => {
+      const v = Number(e.target.value);
+      GM_setValue('rate', v);
+      document.getElementById('tm-rate-label').textContent = v.toFixed(2) + '×';
+      if (audioElement) audioElement.playbackRate = v;
+    });
+    updateUsageLabel();
     updateSpeechButton();
   }
 
@@ -668,6 +705,8 @@
     .tm-speech-btn.playing { background:#f0f0f0; border-color:#ccc; }
     .tm-tts-controls { display:flex; gap:12px; align-items:center; margin:8px 0; }
     .tm-tts-mode-label { font-size:13px; color:#666; }
+    .tm-voice-select { padding:6px; border-radius:6px; border:1px solid #ddd; background:#fff; }
+    .tm-rate-wrap { display:inline-flex; align-items:center; gap:6px; font-size:13px; color:#444; }
     .tm-error { color:#900; background:#fff0f0; padding:12px; border-radius:6px; border:1px solid #f2caca; }
   `);
 
