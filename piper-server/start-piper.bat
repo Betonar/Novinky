@@ -7,7 +7,7 @@ set PY=
 rem Piper needs onnxruntime, which has no wheels for the newest Python versions - prefer 3.12.
 for %%V in (3.12 3.11 3.13 3.10) do (
   if not defined PY (
-    py -%%V -c "import sys" >nul 2>nul && set PY=py -%%V
+    py -%%V -c "import sys" >nul 2>nul && (set PY=py -%%V) && (set PYVER=%%V)
   )
 )
 if not defined PY (
@@ -16,9 +16,16 @@ if not defined PY (
 )
 echo Using %PY%
 
+rem A venv made by a different Python (e.g. 3.14 from an earlier run) cannot install Piper - rebuild it.
+if exist venv\Scripts\python.exe if not exist venv\.made-with-%PYVER% (
+  echo Removing old virtual environment...
+  rmdir /s /q venv
+)
+
 if not exist venv\Scripts\python.exe (
-  echo Creating virtual environment...
+  echo Creating virtual environment with %PY%...
   %PY% -m venv venv || goto :fail
+  echo ok> venv\.made-with-%PYVER%
 )
 
 venv\Scripts\python -c "import piper, flask" >nul 2>nul
