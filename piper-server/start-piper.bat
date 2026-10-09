@@ -1,16 +1,24 @@
 @echo off
 rem Local Piper TTS server for the Novinky reader userscript (http://127.0.0.1:5000).
-rem Needs Python 3.9+ installed (https://www.python.org/downloads/ - tick "Add python.exe to PATH").
+rem Needs Python 3.9+ (python.org installer, or the Python Install Manager: "py install 3.13").
 cd /d "%~dp0"
 
+set PY=
+where py >nul 2>nul && set PY=py -3
+if "%PY%"=="" (where python >nul 2>nul && set PY=python)
+if "%PY%"=="" (
+  echo Python was not found. Install it first ^(py install 3.13^) and run this again.
+  goto :fail
+)
+
 if not exist venv\Scripts\python.exe (
-  echo Installing Piper (one time)...
-  python -m venv venv || goto :fail
+  echo Installing Piper ^(one time^)...
+  %PY% -m venv venv || goto :fail
   venv\Scripts\python -m pip install --upgrade pip piper-tts flask || goto :fail
 )
 
 if not exist voices\cs_CZ-jirka-medium.onnx (
-  echo Downloading Czech voice (one time, ~60 MB)...
+  echo Downloading Czech voice ^(one time, about 60 MB^)...
   venv\Scripts\python -m piper.download_voices cs_CZ-jirka-medium --download-dir voices || goto :fail
 )
 
