@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Novinky.cz - Clean Reader + Neural TTS
 // @namespace    http://tampermonkey.net/
-// @version      3.5
+// @version      3.6
 // @description  Category browser, clean article reader and high-quality Czech neural TTS (Azure) with local fallback.
 // @author       You
 // @match        *://*.novinky.cz/*
@@ -232,7 +232,7 @@
         headers: { 'Content-Type': 'application/json' },
         data: JSON.stringify({ text }),
         responseType: 'arraybuffer',
-        timeout: 60000,
+        timeout: 180000,
         onload: r => r.status === 200
           ? resolve(URL.createObjectURL(new Blob([r.response], { type: 'audio/wav' })))
           : reject(new Error(`Piper HTTP ${r.status}`)),
@@ -256,7 +256,8 @@
 
   // Plays all chunks in order, synthesizing chunk N+1 while N is playing (gapless).
   async function startNeuralSpeech(text, session) {
-    const chunks = sentenceChunking(text, TTS.chunkChars);
+    // Piper runs on the user's own CPU - use short chunks so playback starts sooner.
+    const chunks = sentenceChunking(text, isPiperSel() ? 220 : TTS.chunkChars);
     if (!chunks.length) return;
     let next = synthesizeChunk(chunks[0]);
     next.catch(() => {});
