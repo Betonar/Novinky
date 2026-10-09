@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Novinky.cz + iDNES.cz - Clean Reader + Neural TTS
 // @namespace    http://tampermonkey.net/
-// @version      5.0
+// @version      5.1
 // @description  Multi-source (Novinky.cz, iDNES.cz, Aktuálně.cz; launcher at https://example.com/) category browser, clean article reader and high-quality Czech neural TTS (Azure) with local fallback.
 // @author       You
 // @match        *://*.novinky.cz/*
@@ -1547,7 +1547,7 @@
   // ===========================
   // CSS
   // ===========================
-  GM_addStyle(`
+  const tmStyle = GM_addStyle(`
     #tm-clean-overlay, #tm-trigger-btn {
       --tm-bg: #f5f5f3;
       --tm-surface: #ffffff;
@@ -1589,16 +1589,35 @@
 
     /* --- reset (low specificity, so component rules below win) --- */
     :where(#tm-clean-overlay), :where(#tm-clean-overlay) *, :where(#tm-clean-overlay) *::before, :where(#tm-clean-overlay) *::after { box-sizing: border-box; }
-    :where(#tm-clean-overlay) :where(button, input, select, output) { font: inherit; color: inherit; margin: 0; letter-spacing: normal; text-transform: none; }
-    :where(#tm-clean-overlay) :where(button) { -webkit-tap-highlight-color: transparent; }
-    :where(#tm-clean-overlay) :where(h1, h2, p, ol, li) { margin: 0; padding: 0; }
-    :where(#tm-clean-overlay) :where(ol) { list-style: none; }
-    #tm-clean-overlay [hidden] { display: none !important; }
-    #tm-clean-overlay svg.tm-ic, #tm-trigger-btn svg.tm-ic {
-      width: 20px; height: 20px; flex: none; display: block;
-      fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+    :where(#tm-clean-overlay) button, :where(#tm-clean-overlay) input, :where(#tm-clean-overlay) select, :where(#tm-clean-overlay) output { font: inherit; color: inherit; margin: 0; letter-spacing: normal; text-transform: none; }
+    :where(#tm-clean-overlay) button { -webkit-tap-highlight-color: transparent; }
+    :where(#tm-clean-overlay) h1, :where(#tm-clean-overlay) h2, :where(#tm-clean-overlay) p, :where(#tm-clean-overlay) ol, :where(#tm-clean-overlay) li { margin: 0; padding: 0; }
+    :where(#tm-clean-overlay) ol { list-style: none; }
+    /* Page / extension CSS must not leak in (e.g. example.com has div{opacity:.8}). Element-level specificity like
+       the page's own rules, but this sheet comes last, so these win; our own class rules still win over them. */
+    :where(#tm-clean-overlay) div, :where(#tm-clean-overlay) header, :where(#tm-clean-overlay) main, :where(#tm-clean-overlay) aside, :where(#tm-clean-overlay) nav, :where(#tm-clean-overlay) section, :where(#tm-clean-overlay) span, :where(#tm-clean-overlay) ol, :where(#tm-clean-overlay) li, :where(#tm-clean-overlay) p, :where(#tm-clean-overlay) h1, :where(#tm-clean-overlay) h2, :where(#tm-clean-overlay) a, :where(#tm-clean-overlay) label, :where(#tm-clean-overlay) output, :where(#tm-clean-overlay) button, :where(#tm-clean-overlay) input, :where(#tm-clean-overlay) select {
+      opacity: 1; float: none; filter: none; transform: none; text-shadow: none;
     }
-    #tm-clean-overlay svg.tm-ic .tm-fill { fill: currentColor; stroke: none; }
+    :where(#tm-clean-overlay) div, :where(#tm-clean-overlay) header, :where(#tm-clean-overlay) main, :where(#tm-clean-overlay) aside, :where(#tm-clean-overlay) nav, :where(#tm-clean-overlay) section, :where(#tm-clean-overlay) span, :where(#tm-clean-overlay) ol, :where(#tm-clean-overlay) li, :where(#tm-clean-overlay) p, :where(#tm-clean-overlay) h1, :where(#tm-clean-overlay) h2 {
+      margin: 0; padding: 0; width: auto; max-width: none; min-width: 0; background: none; border: 0; border-radius: 0; box-shadow: none;
+    }
+    #tm-clean-overlay [hidden] { display: none !important; }
+    /* Icons: geometry is !important because some pages / browser add-ons reposition every <svg>
+       (e.g. svg{position:relative;top:-50%}), which pushed the icons to the top edge of their buttons.
+       Size per context via --tm-ic on the parent. */
+    #tm-clean-overlay svg.tm-ic, #tm-trigger-btn svg.tm-ic {
+      display: block !important; flex: none !important;
+      position: var(--tm-ic-pos, static) !important;
+      inset: var(--tm-ic-inset, auto) !important;
+      width: var(--tm-ic, 20px) !important; height: var(--tm-ic, 20px) !important;
+      min-width: 0 !important; min-height: 0 !important; max-width: none !important; max-height: none !important;
+      margin: 0 !important; padding: 0 !important; border: 0 !important;
+      transform: none !important; float: none !important; vertical-align: top !important; overflow: visible !important;
+      opacity: 1 !important; visibility: inherit !important; background: none !important; box-shadow: none !important;
+      fill: none !important; stroke: currentColor !important; stroke-width: 2 !important;
+      stroke-linecap: round !important; stroke-linejoin: round !important;
+    }
+    #tm-clean-overlay svg.tm-ic .tm-fill, #tm-trigger-btn svg.tm-ic .tm-fill { fill: currentColor !important; stroke: none !important; }
     #tm-clean-overlay :focus-visible { outline: 2px solid var(--tm-accent); outline-offset: 2px; }
     #tm-clean-overlay button:disabled { opacity: .4; cursor: default; }
 
@@ -1612,6 +1631,7 @@
       font: 600 15px/1 var(--tm-sans); letter-spacing: .01em; cursor: pointer;
       box-shadow: 0 8px 24px rgba(200,16,46,.35), 0 2px 6px rgba(0,0,0,.18);
       transition: transform .15s ease, background .15s ease;
+      margin: 0; opacity: 1; text-transform: none; letter-spacing: normal; width: auto;
     }
     #tm-trigger-btn:hover { background: var(--tm-accent-hover); transform: translateY(-1px); }
 
@@ -1622,6 +1642,7 @@
       display: none; flex-direction: column; overflow: hidden; overflow: clip;   /* clip: cannot be scrolled by focus() */
       background: var(--tm-bg); color: var(--tm-text);
       font: 15px/1.45 var(--tm-sans); text-align: left;
+      margin: 0; padding: 0; border: 0; border-radius: 0; box-shadow: none; opacity: 1; filter: none; transform: none; max-width: none;
       -webkit-text-size-adjust: 100%; text-size-adjust: 100%;
       -webkit-font-smoothing: antialiased;
     }
@@ -1634,7 +1655,7 @@
       width: 34px; height: 34px; flex: none; display: grid; place-items: center;
       border-radius: 9px; background: var(--tm-accent); color: var(--tm-accent-ink); margin-right: 6px;
     }
-    #tm-brand svg.tm-ic { width: 18px; height: 18px; }
+    #tm-brand { --tm-ic: 18px; }
     #tm-back-btn { display: none; margin-left: -8px; }
     #tm-clean-overlay.tm-mode-detail #tm-back-btn { display: inline-grid; }
     #tm-clean-overlay.tm-mode-detail #tm-brand { display: none; }
@@ -1684,7 +1705,7 @@
 
     .tm-list-meta { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin: 0 4px 10px; font-size: 13px; color: var(--tm-text-3); }
     .tm-list-hint { display: inline-flex; align-items: center; gap: 4px; }
-    .tm-list-hint svg.tm-ic { width: 14px; height: 14px; }
+    .tm-list-hint { --tm-ic: 14px; }
     .tm-list {
       display: flex; flex-direction: column;
       background: var(--tm-surface); border: 1px solid var(--tm-border); border-radius: 14px; overflow: hidden;
@@ -1704,7 +1725,7 @@
       border: 0; border-radius: 50%; background: var(--tm-accent-soft); color: var(--tm-accent); cursor: pointer;
       transition: background .15s ease, color .15s ease, transform .1s ease;
     }
-    .tm-row-play svg.tm-ic { width: 16px; height: 16px; }
+    .tm-row-play { --tm-ic: 16px; }
     .tm-row-play:hover { background: var(--tm-accent); color: var(--tm-accent-ink); }
     .tm-row-play:active { transform: scale(.94); }
     .tm-row-play[data-state="playing"], .tm-row-play[data-state="paused"] { background: var(--tm-accent); color: var(--tm-accent-ink); }
@@ -1722,7 +1743,7 @@
       border: 1.5px solid var(--tm-border); border-radius: 10px; background: transparent; color: var(--tm-text-3); cursor: pointer;
       transition: all .15s ease;
     }
-    .tm-row-queue svg.tm-ic { width: 17px; height: 17px; }
+    .tm-row-queue { --tm-ic: 17px; }
     .tm-row-queue:hover { border-color: var(--tm-text-3); color: var(--tm-text); }
     .tm-row-queue[aria-pressed="true"] { background: var(--tm-text); border-color: var(--tm-text); color: var(--tm-surface); }
 
@@ -1731,7 +1752,7 @@
       width: 34px; height: 34px; display: grid; place-items: center; padding: 0;
       border: 0; border-radius: 8px; background: transparent; color: var(--tm-text-3); cursor: pointer;
     }
-    .tm-q-btn svg.tm-ic { width: 18px; height: 18px; }
+    .tm-q-btn { --tm-ic: 18px; }
     .tm-q-btn:hover:not(:disabled) { background: var(--tm-surface); color: var(--tm-text); }
     .tm-q-del:hover:not(:disabled) { color: var(--tm-accent); }
 
@@ -1748,7 +1769,7 @@
       font-size: 14px; font-weight: 600; line-height: 1; text-decoration: none; white-space: nowrap; cursor: pointer;
       transition: background .15s ease, border-color .15s ease, color .15s ease;
     }
-    .tm-btn svg.tm-ic { width: 18px; height: 18px; }
+    .tm-btn { --tm-ic: 18px; }
     .tm-btn:hover { background: var(--tm-surface-2); }
     .tm-btn-primary { background: var(--tm-accent); border-color: var(--tm-accent); color: var(--tm-accent-ink); }
     .tm-btn-primary:hover { background: var(--tm-accent-hover); border-color: var(--tm-accent-hover); }
@@ -1785,7 +1806,7 @@
     /* --- states / skeleton --- */
     .tm-state { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 10px; padding: 56px 20px; }
     .tm-state-icon { width: 56px; height: 56px; display: grid; place-items: center; border-radius: 50%; background: var(--tm-surface-2); color: var(--tm-text-3); margin-bottom: 4px; }
-    .tm-state-icon svg.tm-ic { width: 26px; height: 26px; }
+    .tm-state-icon { --tm-ic: 26px; }
     .tm-state-error .tm-state-icon { background: var(--tm-accent-soft); color: var(--tm-accent); }
     .tm-state-title { font-size: 18px; font-weight: 700; }
     .tm-state-text { max-width: 460px; color: var(--tm-text-2); font-size: 14.5px; overflow-wrap: anywhere; }
@@ -1835,7 +1856,7 @@
     }
     .tm-pl-main:hover { background: var(--tm-accent-hover); }
     .tm-pl-main:active { transform: scale(.94); }
-    .tm-pl-main svg.tm-ic { width: 20px; height: 20px; }
+    .tm-pl-main { --tm-ic: 20px; }
     .tm-pl-main .tm-spinner { width: 18px; height: 18px; }
     .tm-pl-info { grid-area: info; min-width: 0; }
     #tm-pl-title { font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1876,7 +1897,8 @@
       font-size: 15px; cursor: pointer; text-overflow: ellipsis;
     }
     .tm-select option, .tm-select optgroup { background: var(--tm-surface); color: var(--tm-text); }
-    .tm-select-wrap svg.tm-ic { position: absolute; right: 12px; top: 12px; pointer-events: none; color: var(--tm-text-3); }
+    .tm-select-wrap { --tm-ic-pos: absolute; --tm-ic-inset: 12px 12px auto auto; }
+    .tm-select-wrap svg.tm-ic { pointer-events: none; color: var(--tm-text-3); }
     .tm-seg { display: flex; gap: 2px; margin-top: 10px; padding: 3px; border-radius: 10px; background: var(--tm-surface-2); }
     .tm-seg button {
       flex: 1 1 0; height: 32px; padding: 0 6px; border: 0; border-radius: 8px; background: transparent;
@@ -1983,6 +2005,9 @@
       #tm-clean-overlay *, #tm-trigger-btn { transition: none !important; animation-duration: 0s !important; }
     }
   `);
+  // Last in the document: on equal specificity our resets beat the page's own element rules
+  // (even <style> tags inside <body>).
+  try { if (tmStyle && tmStyle.parentNode) document.documentElement.appendChild(tmStyle); } catch { /* keep default place */ }
 
   // ===========================
   // INIT
