@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Novinky.cz - Clean Reader + Neural TTS
 // @namespace    http://tampermonkey.net/
-// @version      3.1
+// @version      3.2
 // @description  Category browser, clean article reader and high-quality Czech neural TTS (Azure) with local fallback.
 // @author       You
 // @match        *://*.novinky.cz/*
@@ -10,7 +10,9 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
-// @connect      *.tts.speech.microsoft.com
+// @connect      tts.speech.microsoft.com
+// @connect      germanywestcentral.tts.speech.microsoft.com
+// @connect      westeurope.tts.speech.microsoft.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -186,7 +188,7 @@
           if (r.status !== 200) return reject(new Error(`HTTP ${r.status} (401/403 = špatný klíč nebo region)`));
           resolve(URL.createObjectURL(new Blob([r.response], { type: 'audio/mpeg' })));
         },
-        onerror: () => reject(new Error('síťová chyba / blokováno (povolte připojení v Tampermonkey)')),
+        onerror: e => reject(new Error('síťová chyba / blokováno (' + ((e && e.error) || 'povolte připojení v Tampermonkey') + ')')),
         ontimeout: () => reject(new Error('Azure TTS timeout'))
       });
     });
