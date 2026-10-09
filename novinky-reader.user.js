@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Novinky.cz - Clean Reader + Neural TTS
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      3.1
 // @description  Category browser, clean article reader and high-quality Czech neural TTS (Azure) with local fallback.
 // @author       You
 // @match        *://*.novinky.cz/*
@@ -73,6 +73,7 @@
   let useExternalThisSession = false;
   let ttsSession = 0;          // bumped on every stop/start to cancel stale async work
   let ttsPaused = false;
+  let lastTtsError = '';
 
   // ===========================
   // HELPERS
@@ -182,10 +183,10 @@
         responseType: 'arraybuffer',
         timeout: 30000,
         onload: r => {
-          if (r.status !== 200) return reject(new Error(`Azure TTS HTTP ${r.status}`));
+          if (r.status !== 200) return reject(new Error(`HTTP ${r.status} (401/403 = špatný klíč nebo region)`));
           resolve(URL.createObjectURL(new Blob([r.response], { type: 'audio/mpeg' })));
         },
-        onerror: () => reject(new Error('Azure TTS network error')),
+        onerror: () => reject(new Error('síťová chyba / blokováno (povolte připojení v Tampermonkey)')),
         ontimeout: () => reject(new Error('Azure TTS timeout'))
       });
     });
@@ -360,6 +361,7 @@
     if (speechPlaying) { stopSpeech(); return; }
 
     const session = ++ttsSession;
+    lastTtsError = '';
     if (getKey()) {
       try {
         await startNeuralSpeech(text, session);
@@ -368,12 +370,14 @@
         if (session !== ttsSession) return;
         console.warn('Neural TTS failed, falling back to local TTS:', err);
         stopSpeech();
+        lastTtsError = err && err.message ? err.message : String(err);
       }
     } else {
       console.info('Azure key not set (Tampermonkey menu), using local TTS.');
     }
     useExternalThisSession = false;
     await startLocalSpeech(text);
+    updateSpeechButton();
   }
 
   function updateSpeechButton() {
@@ -391,7 +395,7 @@
       button.classList.remove('playing');
     }
     if (modeLabel) {
-      modeLabel.textContent = !getKey() ? 'Lokální TTS (chybí Azure klíč)' : (useExternalThisSession ? 'Neurální hlas (Azure)' : 'Neurální hlas (Azure) – připraven');
+      modeLabel.textContent = lastTtsError && !useExternalThisSession ? `Lokální TTS – Azure selhal: ${lastTtsError}` : !getKey() ? 'Lokální TTS (chybí Azure klíč)' : (useExternalThisSession ? 'Neurální hlas (Azure)' : 'Neurální hlas (Azure) – připraven');
     }
   }
 
