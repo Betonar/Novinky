@@ -12,9 +12,15 @@ if "%PY%"=="" (
 )
 
 if not exist venv\Scripts\python.exe (
-  echo Installing Piper ^(one time^)...
+  echo Creating virtual environment...
   %PY% -m venv venv || goto :fail
-  venv\Scripts\python -m pip install --upgrade pip piper-tts flask || goto :fail
+)
+
+venv\Scripts\python -c "import piper, flask" >nul 2>nul
+if errorlevel 1 (
+  echo Installing Piper ^(one time^)...
+  venv\Scripts\python -m pip install --upgrade pip || goto :fail
+  venv\Scripts\python -m pip install piper-tts flask || goto :fail
 )
 
 if not exist voices\cs_CZ-jirka-medium.onnx (
