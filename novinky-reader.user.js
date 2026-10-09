@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Novinky.cz - Clean Reader + Neural TTS
 // @namespace    http://tampermonkey.net/
-// @version      3.8
+// @version      3.9
 // @description  Category browser, clean article reader and high-quality Czech neural TTS (Azure) with local fallback.
 // @author       You
 // @match        *://*.novinky.cz/*
@@ -114,6 +114,15 @@
   let queueActive = false;     // true while the current article was started from the queue
   let queueIndex = -1;         // index of the playing item in queue
   let queueViewOpen = false;
+
+  // Position tracking (for the seek slider). Text is split into sentences; positions are
+  // measured in characters of the sentence-normalised text.
+  let speechFullText = '';
+  let speechSentences = [];
+  let speechStarts = [];
+  let speechTotalChars = 1;
+  let speechPos = 0;
+  let seekDragging = false;
 
   // ===========================
   // HELPERS
@@ -253,9 +262,14 @@
     });
   }
 
-  function playUrl(url, session) {
+  function playUrl(url, session, chunk) {
     return new Promise((resolve, reject) => {
       const a = new Audio(url);
+      a.ontimeupdate = () => {
+        if (session === ttsSession && chunk && a.duration > 0) {
+          setSpeechPos(chunk.startChar + (a.currentTime / a.duration) * chunk.text.length);
+        }
+      };
       a.playbackRate = getRate();
       a.preservesPitch = true;
       audioElement = a;
@@ -266,18 +280,19 @@
   }
 
   // Plays all chunks in order, synthesizing chunk N+1 while N is playing (gapless).
-  async function startNeuralSpeech(text, session) {
+  async function startNeuralSpeech(session, fromSentence) {
     // Piper runs on the user's own CPU - use short chunks so playback starts sooner.
-    const chunks = sentenceChunking(text, isPiperSel() ? 220 : TTS.chunkChars);
+    const chunks = chunksFrom(fromSentence, isPiperSel() ? 220 : TTS.chunkChars);
     if (!chunks.length) return;
-    let next = synthesizeChunk(chunks[0]);
+    let next = synthesizeChunk(chunks[0].text);
     next.catch(() => {});
     for (let i = 0; i < chunks.length; i++) {
       const url = await next;                       // throws -> caller falls back
       if (session !== ttsSession) { URL.revokeObjectURL(url); return; }
       if (i === 0) { speechPlaying = true; useExternalThisSession = true; updateSpeechButton(); }
-      if (i + 1 < chunks.length) { next = synthesizeChunk(chunks[i + 1]); next.catch(() => {}); }
-      await playUrl(url, session);
+      if (i + 1 < chunks.length) { next = synthesizeChunk(chunks[i + 1].text); next.catch(() => {}); }
+      setSpeechPos(chunks[i].startChar);
+      await playUrl(url, session, chunks[i]);
       URL.revokeObjectURL(url);
       if (session !== ttsSession) return;
     }
@@ -288,6 +303,7 @@
   function speechFinished() {
     speechPlaying = false;
     ttsPaused = false;
+    speechSentences = []; speechFullText = ''; speechPos = 0;
     if (queueActive && queue[queueIndex] && queue[queueIndex].url === currentSpeechUrl) {
       const i = queueIndex;
       queue.splice(i, 1);                           // played items leave the queue
@@ -341,27 +357,53 @@
   }
 
   // Split text into sentences and group into chunks of ~300-800 chars for natural pauses
-  function sentenceChunking(text, maxChars = 700) {
-    // Basic sentence split using punctuation
-    const sentences = text
+  function prepareSentences(text) {
+    speechFullText = text;
+    speechSentences = text
       .replace(/\r\n/g, ' ')
       .replace(/\n/g, ' ')
       .split(/(?<=[.?!…])\s+/u)
-      .map(s => s.trim())
+      .map(t => t.trim())
       .filter(Boolean);
+    speechStarts = [];
+    let pos = 0;
+    for (const t of speechSentences) { speechStarts.push(pos); pos += t.length + 1; }
+    speechTotalChars = Math.max(1, pos);
+    speechPos = 0;
+  }
 
-    const chunks = [];
-    let current = '';
-    for (const s of sentences) {
-      if ((current + ' ' + s).trim().length <= maxChars) {
-        current = (current + ' ' + s).trim();
+  // Group sentences from index k on into chunks of at most maxChars (a long sentence stays whole).
+  function chunksFrom(k, maxChars) {
+    const out = [];
+    let cur = '', curStart = 0;
+    for (let i = k; i < speechSentences.length; i++) {
+      const t = speechSentences[i];
+      if (cur && (cur + ' ' + t).length > maxChars) {
+        out.push({ text: cur, startChar: curStart });
+        cur = t; curStart = speechStarts[i];
       } else {
-        if (current) chunks.push(current);
-        current = s;
+        if (!cur) curStart = speechStarts[i];
+        cur = cur ? cur + ' ' + t : t;
       }
     }
-    if (current) chunks.push(current);
-    return chunks;
+    if (cur) out.push({ text: cur, startChar: curStart });
+    return out;
+  }
+
+  function setSpeechPos(pos) {
+    speechPos = Math.max(0, Math.min(speechTotalChars, pos));
+    updateSeekUI();
+  }
+
+  // Jump to a fraction (0..1) of the article: restart reading from the nearest sentence start.
+  async function seekToFraction(f) {
+    if (!speechSentences.length || !speechFullText) return;
+    const target = f * speechTotalChars;
+    let k = 0;
+    for (let i = 0; i < speechStarts.length; i++) if (speechStarts[i] <= target) k = i;
+    const text = speechFullText;
+    stopSpeech();
+    await toggleSpeechUnified(text, k);
   }
 
   function stopLocalSpeech() {
@@ -374,10 +416,10 @@
     updateSpeechButton();
   }
 
-  async function startLocalSpeech(text) {
+  async function startLocalSpeech(fromSentence) {
     stopLocalSpeech();
     const session = ttsSession;
-    speechChunks = sentenceChunking(text, 700);
+    speechChunks = chunksFrom(fromSentence, 700);
     if (!speechChunks.length) { speechFinished(); return; }
     speechIndex = 0;
     speechPlaying = true;
@@ -395,8 +437,12 @@
       if (natural) speechFinished(); else updateSpeechButton();
       return;
     }
-    const text = speechChunks[speechIndex];
-    speechUtterance = new SpeechSynthesisUtterance(text);
+    const chunk = speechChunks[speechIndex];
+    setSpeechPos(chunk.startChar);
+    speechUtterance = new SpeechSynthesisUtterance(chunk.text);
+    speechUtterance.onboundary = e => {
+      if (session === ttsSession && typeof e.charIndex === 'number') setSpeechPos(chunk.startChar + e.charIndex);
+    };
     if (selectedVoice) {
       speechUtterance.voice = selectedVoice;
       speechUtterance.lang = selectedVoice.lang || 'cs-CZ';
@@ -439,7 +485,7 @@
     updateSpeechButton();
   }
 
-  async function toggleSpeechUnified(text) {
+  async function toggleSpeechUnified(text, fromSentence = 0) {
     // Pause / resume of the neural audio
     if (speechPlaying) {
       if (audioElement) {
@@ -456,9 +502,12 @@
 
     const session = ++ttsSession;
     lastTtsError = '';
+    prepareSentences(text);
+    fromSentence = Math.min(fromSentence, Math.max(0, speechSentences.length - 1));
+    setSpeechPos(speechStarts[fromSentence] || 0);
     if ((getKey() && isAzureSel()) || isPiperSel()) {
       try {
-        await startNeuralSpeech(text, session);
+        await startNeuralSpeech(session, fromSentence);
         return;
       } catch (err) {
         if (session !== ttsSession) return;
@@ -470,7 +519,7 @@
       // local voice selected (or no Azure key)
     }
     useExternalThisSession = false;
-    await startLocalSpeech(text);
+    await startLocalSpeech(fromSentence);
     updateSpeechButton();
   }
 
@@ -530,6 +579,8 @@
         <button id="tm-pl-next" class="tm-pl-btn" type="button" title="Další ve frontě">⏭</button>
         <button id="tm-pl-stop" class="tm-pl-btn" type="button" title="Zastavit">⏹</button>
         <div id="tm-pl-title"></div>
+        <input id="tm-pl-seek" type="range" min="0" max="1000" value="0" step="1" disabled title="Posun v článku">
+        <span id="tm-pl-pos">0 %</span>
         <button id="tm-pl-queue" class="tm-pl-btn tm-pl-queue" type="button">📋 Fronta (0)</button>
       </div>
     `;
@@ -564,6 +615,15 @@
       else playQueue();
     });
     overlay.querySelector('#tm-pl-stop').addEventListener('click', stopAll);
+    const seek = overlay.querySelector('#tm-pl-seek');
+    seek.addEventListener('input', () => {
+      seekDragging = true;
+      overlay.querySelector('#tm-pl-pos').textContent = Math.round(seek.value / 10) + ' %';
+    });
+    seek.addEventListener('change', () => {
+      seekDragging = false;
+      seekToFraction(seek.value / 1000);
+    });
     overlay.querySelector('#tm-pl-queue').addEventListener('click', showQueueView);
 
     const trigger = document.createElement('button');
@@ -749,6 +809,7 @@
     busyUrl = url;
     queueActive = idx >= 0;
     queueIndex = idx;
+    speechSentences = []; speechFullText = ''; speechPos = 0;   // slider disabled until the text is loaded
     refreshQueueView();
     updateSpeechButton();
     try {
@@ -774,6 +835,7 @@
   }
 
   function stopAll() {
+    speechSentences = []; speechFullText = ''; speechPos = 0;
     listPlayToken++;
     queueActive = false;
     queueIndex = -1;
@@ -865,6 +927,18 @@
       ? currentTitle
       : (queue.length ? `Ve frontě: ${queue.length}` : '');
     document.getElementById('tm-pl-queue').textContent = `📋 Fronta (${queue.length})`;
+    updateSeekUI();
+  }
+
+  function updateSeekUI() {
+    const seek = document.getElementById('tm-pl-seek');
+    if (!seek) return;
+    const enabled = speechSentences.length > 0 && (speechPlaying || !!busyUrl);
+    seek.disabled = !enabled;
+    if (seekDragging) return;
+    const frac = enabled ? speechPos / speechTotalChars : 0;
+    seek.value = String(Math.round(frac * 1000));
+    document.getElementById('tm-pl-pos').textContent = Math.round(frac * 100) + ' %';
   }
 
   function showQueueView() {
@@ -1065,6 +1139,8 @@
     .tm-row-queue { width:20px; height:20px; cursor:pointer; accent-color:#cc0000; }
     #tm-player { flex:0 0 auto; display:flex; align-items:center; gap:8px; padding:8px 16px; background:#f4f6f8; border-top:1px solid #ddd; }
     #tm-pl-title { flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:14px; color:#333; }
+    #tm-pl-seek { flex:0 1 240px; min-width:80px; accent-color:#cc0000; }
+    #tm-pl-pos { flex:0 0 auto; width:42px; text-align:right; font-size:13px; color:#555; }
     .tm-pl-btn { padding:8px 12px; border-radius:6px; border:1px solid #ddd; background:#fff; cursor:pointer; font-size:15px; }
     .tm-pl-btn:hover { background:#f0f0f0; }
     .tm-queue-actions { display:flex; gap:8px; margin-top:10px; }
