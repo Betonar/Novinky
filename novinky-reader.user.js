@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Novinky.cz - Clean Reader + Neural TTS
 // @namespace    http://tampermonkey.net/
-// @version      3.7
+// @version      3.8
 // @description  Category browser, clean article reader and high-quality Czech neural TTS (Azure) with local fallback.
 // @author       You
 // @match        *://*.novinky.cz/*
@@ -106,6 +106,14 @@
   let currentSpeechUrl = '';   // article currently read (for the list play buttons)
   let busyUrl = '';            // article being fetched / synthesized
   let listPlayToken = 0;
+  let currentTitle = '';       // title of the article being read (for the player bar)
+  let viewedArticleUrl = '';   // article open in the reader view ('' in list / queue view)
+
+  // Reading queue (persisted). Played items are removed from it automatically.
+  let queue = (() => { try { const q = GM_getValue('queue', []); return Array.isArray(q) ? q : []; } catch { return []; } })();
+  let queueActive = false;     // true while the current article was started from the queue
+  let queueIndex = -1;         // index of the playing item in queue
+  let queueViewOpen = false;
 
   // ===========================
   // HELPERS
@@ -273,7 +281,21 @@
       URL.revokeObjectURL(url);
       if (session !== ttsSession) return;
     }
+    speechFinished();
+  }
+
+  // Called when an article has been read to the end (not when it was stopped).
+  function speechFinished() {
     speechPlaying = false;
+    ttsPaused = false;
+    if (queueActive && queue[queueIndex] && queue[queueIndex].url === currentSpeechUrl) {
+      const i = queueIndex;
+      queue.splice(i, 1);                           // played items leave the queue
+      saveQueue();
+      if (queue[i]) playArticle(queue[i].url, queue[i].title, i);
+      else { queueActive = false; queueIndex = -1; currentSpeechUrl = ''; currentTitle = ''; }
+    }
+    uiQueueChanged();
     updateSpeechButton();
   }
 
@@ -344,6 +366,7 @@
 
   function stopLocalSpeech() {
     window.speechSynthesis.cancel();
+    window.speechSynthesis.resume();   // a paused engine would otherwise swallow the next utterance
     speechPlaying = false;
     speechUtterance = null;
     speechChunks = [];
@@ -353,19 +376,23 @@
 
   async function startLocalSpeech(text) {
     stopLocalSpeech();
+    const session = ttsSession;
     speechChunks = sentenceChunking(text, 700);
-    if (!speechChunks.length) return;
+    if (!speechChunks.length) { speechFinished(); return; }
     speechIndex = 0;
     speechPlaying = true;
     const voice = await chooseVoice();
-    speakNextLocalChunk(voice);
+    if (session !== ttsSession) return;           // stopped while the voices were loading
+    speakNextLocalChunk(voice, session);
   }
 
-  function speakNextLocalChunk(selectedVoice) {
+  function speakNextLocalChunk(selectedVoice, session) {
+    if (session !== ttsSession) return;
     if (!speechPlaying || speechIndex >= speechChunks.length) {
+      const natural = speechPlaying && speechIndex >= speechChunks.length;
       speechPlaying = false;
       speechIndex = 0;
-      updateSpeechButton();
+      if (natural) speechFinished(); else updateSpeechButton();
       return;
     }
     const text = speechChunks[speechIndex];
@@ -383,10 +410,12 @@
 
     speechUtterance.onend = function () {
       // small pause between chunks to improve naturalness
+      if (session !== ttsSession) return;
       speechIndex++;
-      setTimeout(() => speakNextLocalChunk(selectedVoice), 220);
+      setTimeout(() => speakNextLocalChunk(selectedVoice, session), 220);
     };
     speechUtterance.onerror = function () {
+      if (session !== ttsSession) return;
       speechPlaying = false;
       updateSpeechButton();
     };
@@ -412,13 +441,18 @@
 
   async function toggleSpeechUnified(text) {
     // Pause / resume of the neural audio
-    if (audioElement && speechPlaying) {
-      if (ttsPaused) { await audioElement.play(); ttsPaused = false; }
-      else { audioElement.pause(); ttsPaused = true; }
+    if (speechPlaying) {
+      if (audioElement) {
+        if (ttsPaused) { await audioElement.play(); ttsPaused = false; }
+        else { audioElement.pause(); ttsPaused = true; }
+      } else if (ttsPaused) {
+        window.speechSynthesis.resume(); ttsPaused = false;
+      } else {
+        window.speechSynthesis.pause(); ttsPaused = true;
+      }
       updateSpeechButton();
       return;
     }
-    if (speechPlaying) { stopSpeech(); return; }
 
     const session = ++ttsSession;
     lastTtsError = '';
@@ -448,14 +482,17 @@
       b.textContent = mine && speechPlaying ? (ttsPaused ? '▶' : '⏸') : (mine && busyUrl === b.dataset.url ? '…' : '▶');
       b.classList.toggle('playing', mine && speechPlaying);
     });
+    updatePlayerUI();
+    syncQueueChecks();
     if (!button) {
       if (modeLabel) modeLabel.textContent = modeText();
       return;
     }
-    if (speechPlaying && !ttsPaused) {
+    const active = speechPlaying && currentSpeechUrl === viewedArticleUrl;
+    if (active && !ttsPaused) {
       button.innerHTML = `<span class="tm-speech-icon">⏸</span><span class="tm-speech-label">Pozastavit čtení</span>`;
       button.classList.add('playing');
-    } else if (speechPlaying && ttsPaused) {
+    } else if (active && ttsPaused) {
       button.innerHTML = `<span class="tm-speech-icon">▶</span><span class="tm-speech-label">Pokračovat</span>`;
       button.classList.add('playing');
     } else {
@@ -488,6 +525,13 @@
       </div>
       <div id="tm-nav"></div>
       <div id="tm-content"></div>
+      <div id="tm-player" style="display:none;">
+        <button id="tm-pl-toggle" class="tm-pl-btn" type="button" title="Přehrát / pozastavit">▶</button>
+        <button id="tm-pl-next" class="tm-pl-btn" type="button" title="Další ve frontě">⏭</button>
+        <button id="tm-pl-stop" class="tm-pl-btn" type="button" title="Zastavit">⏹</button>
+        <div id="tm-pl-title"></div>
+        <button id="tm-pl-queue" class="tm-pl-btn tm-pl-queue" type="button">📋 Fronta (0)</button>
+      </div>
     `;
     document.body.appendChild(overlay);
 
@@ -502,14 +546,25 @@
     });
 
     overlay.querySelector('#tm-close-btn').addEventListener('click', () => {
-      stopSpeech();
+      stopAll();
       overlay.style.display = 'none';
     });
 
     overlay.querySelector('#tm-back-btn').addEventListener('click', () => {
-      stopSpeech();
       showArticleList();
     });
+
+    overlay.querySelector('#tm-pl-toggle').addEventListener('click', () => {
+      if (speechPlaying) toggleSpeechUnified('');
+      else playQueue();
+    });
+    overlay.querySelector('#tm-pl-next').addEventListener('click', () => {
+      if (queueActive && queueIndex + 1 < queue.length) playArticle(queue[queueIndex + 1].url, queue[queueIndex + 1].title, queueIndex + 1);
+      else if (queueActive) stopAll();
+      else playQueue();
+    });
+    overlay.querySelector('#tm-pl-stop').addEventListener('click', stopAll);
+    overlay.querySelector('#tm-pl-queue').addEventListener('click', showQueueView);
 
     const trigger = document.createElement('button');
     trigger.id = 'tm-trigger-btn';
@@ -547,7 +602,8 @@
   // ===========================
   async function loadCategory(path, activeBtn) {
     const content = document.getElementById('tm-content');
-    stopSpeech();
+    queueViewOpen = false;
+    viewedArticleUrl = '';
     currentCategoryPath = path;
     currentCategoryButton = activeBtn || currentCategoryButton;
     setArticleMode(false);
@@ -586,6 +642,25 @@
       const row = document.createElement('div');
       row.className = 'tm-article-row';
 
+      const play = document.createElement('button');
+      play.type = 'button';
+      play.className = 'tm-row-play';
+      play.dataset.url = article.url;
+      play.title = 'Přečíst článek bez otevření';
+      play.textContent = '▶';
+      play.addEventListener('click', () => playFromList(article.url, article.title));
+
+      const check = document.createElement('label');
+      check.className = 'tm-row-queue-wrap';
+      check.title = 'Přidat do fronty';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.className = 'tm-row-queue';
+      cb.dataset.url = article.url;
+      cb.checked = queueHas(article.url);
+      cb.addEventListener('change', () => cb.checked ? queueAdd(article) : queueRemoveUrl(article.url));
+      check.appendChild(cb);
+
       const item = document.createElement('button');
       item.type = 'button';
       item.className = 'tm-article-link';
@@ -596,16 +671,9 @@
       `;
       item.addEventListener('click', () => loadArticle(article.url));
 
-      const play = document.createElement('button');
-      play.type = 'button';
-      play.className = 'tm-row-play';
-      play.dataset.url = article.url;
-      play.title = 'Přečíst článek bez otevření';
-      play.textContent = '▶';
-      play.addEventListener('click', () => playFromList(article.url));
-
-      row.appendChild(item);
       row.appendChild(play);
+      row.appendChild(check);
+      row.appendChild(item);
       list.appendChild(row);
     });
     container.appendChild(list);
@@ -615,7 +683,7 @@
 
   async function loadArticle(url) {
     const content = document.getElementById('tm-content');
-    stopSpeech();
+    queueViewOpen = false;
     setArticleMode(true);
     setHeaderTitle('Načítám článek…');
     content.innerHTML = `<div class="tm-loader">Načítám článek…</div>`;
@@ -672,17 +740,16 @@
     updateUsageLabel();
   }
 
-  // Play button next to a headline: fetch the article and read it without opening it.
-  async function playFromList(url) {
-    if (speechPlaying && currentSpeechUrl === url) {
-      await toggleSpeechUnified('');          // pause / resume (or stop for local voices)
-      updateSpeechButton();
-      return;
-    }
+  // Fetch an article and read it. idx >= 0 means it is played from the queue.
+  async function playArticle(url, title, idx = -1) {
     stopSpeech();
     const token = ++listPlayToken;
     currentSpeechUrl = url;
+    currentTitle = title || '';
     busyUrl = url;
+    queueActive = idx >= 0;
+    queueIndex = idx;
+    refreshQueueView();
     updateSpeechButton();
     try {
       const doc = await fetchDocument(url);
@@ -695,6 +762,167 @@
     }
     if (token === listPlayToken) busyUrl = '';
     updateSpeechButton();
+  }
+
+  // Play button next to a headline: read the article without opening it.
+  async function playFromList(url, title) {
+    if (speechPlaying && currentSpeechUrl === url) {
+      await toggleSpeechUnified('');          // pause / resume
+      return;
+    }
+    await playArticle(url, title, -1);
+  }
+
+  function stopAll() {
+    listPlayToken++;
+    queueActive = false;
+    queueIndex = -1;
+    busyUrl = '';
+    currentSpeechUrl = '';
+    currentTitle = '';
+    stopSpeech();
+    uiQueueChanged();
+  }
+
+  // ===========================
+  // QUEUE
+  // ===========================
+  const saveQueue = () => { try { GM_setValue('queue', queue); } catch { /* ignore */ } };
+  const queueHas = url => queue.some(q => q.url === url);
+
+  function uiQueueChanged() {
+    syncQueueChecks();
+    updatePlayerUI();
+    refreshQueueView();
+  }
+
+  function queueAdd(article) {
+    if (!queueHas(article.url)) {
+      queue.push({ url: article.url, title: article.title });
+      saveQueue();
+    }
+    uiQueueChanged();
+  }
+
+  function queueRemove(i) {
+    if (i < 0 || i >= queue.length) return;
+    const wasCurrent = queueActive && i === queueIndex;
+    queue.splice(i, 1);
+    saveQueue();
+    if (queueActive) {
+      if (wasCurrent) {
+        listPlayToken++;
+        stopSpeech();
+        busyUrl = '';
+        if (queue[i]) { playArticle(queue[i].url, queue[i].title, i); return; }
+        queueActive = false; queueIndex = -1; currentSpeechUrl = ''; currentTitle = '';
+      } else if (i < queueIndex) {
+        queueIndex--;
+      }
+    }
+    uiQueueChanged();
+    updateSpeechButton();
+  }
+
+  function queueRemoveUrl(url) { queueRemove(queue.findIndex(q => q.url === url)); }
+
+  function queueMove(i, dir) {
+    const j = i + dir;
+    if (i < 0 || j < 0 || i >= queue.length || j >= queue.length) return;
+    [queue[i], queue[j]] = [queue[j], queue[i]];
+    if (queueActive) {
+      if (queueIndex === i) queueIndex = j;
+      else if (queueIndex === j) queueIndex = i;
+    }
+    saveQueue();
+    uiQueueChanged();
+  }
+
+  function queueClear() {
+    if (queueActive) stopAll();
+    queue = [];
+    saveQueue();
+    uiQueueChanged();
+  }
+
+  function playQueue() {
+    if (queue.length) playArticle(queue[0].url, queue[0].title, 0);
+  }
+
+  function syncQueueChecks() {
+    document.querySelectorAll('.tm-row-queue').forEach(cb => {
+      cb.checked = queueHas(cb.dataset.url);
+    });
+  }
+
+  function updatePlayerUI() {
+    const player = document.getElementById('tm-player');
+    if (!player) return;
+    const busy = !!busyUrl;
+    player.style.display = (queue.length || speechPlaying || busy) ? 'flex' : 'none';
+    document.getElementById('tm-pl-toggle').textContent = speechPlaying ? (ttsPaused ? '▶' : '⏸') : (busy ? '…' : '▶');
+    document.getElementById('tm-pl-title').textContent = (speechPlaying || busy) && currentTitle
+      ? currentTitle
+      : (queue.length ? `Ve frontě: ${queue.length}` : '');
+    document.getElementById('tm-pl-queue').textContent = `📋 Fronta (${queue.length})`;
+  }
+
+  function showQueueView() {
+    queueViewOpen = true;
+    viewedArticleUrl = '';
+    setArticleMode(true);
+    setHeaderTitle('Fronta');
+    renderQueueView();
+  }
+
+  function refreshQueueView() {
+    if (queueViewOpen) renderQueueView();
+  }
+
+  function renderQueueView() {
+    const content = document.getElementById('tm-content');
+    if (!content) return;
+    const scroll = content.scrollTop;
+    content.innerHTML = `
+      <div class="tm-list-tts">
+        <div class="tm-tts-controls">${ttsOptionsHTML()}</div>
+        <div id="tm-usage-label" class="tm-tts-mode-label"></div>
+        <div class="tm-queue-actions">
+          <button id="tm-q-play" class="tm-speech-btn" type="button">▶ Přehrát frontu</button>
+          <button id="tm-q-clear" class="tm-speech-btn" type="button">🗑 Vyčistit</button>
+        </div>
+      </div>
+      <div id="tm-queue-list"></div>`;
+    const list = content.querySelector('#tm-queue-list');
+    if (!queue.length) {
+      list.innerHTML = `<div class="tm-loader">Fronta je prázdná. V seznamu článků zaškrtněte políčka u titulků.</div>`;
+    }
+    queue.forEach((item, i) => {
+      const row = document.createElement('div');
+      row.className = 'tm-queue-row' + (queueActive && i === queueIndex ? ' current' : '');
+      const mk = (cls, text, title, fn) => {
+        const b = document.createElement('button');
+        b.type = 'button'; b.className = cls; b.textContent = text; b.title = title;
+        b.addEventListener('click', fn);
+        return b;
+      };
+      row.appendChild(mk('tm-row-play' + (queueActive && i === queueIndex && speechPlaying ? ' playing' : ''),
+        queueActive && i === queueIndex && speechPlaying ? (ttsPaused ? '▶' : '⏸') : '▶', 'Přehrát odtud',
+        () => (queueActive && i === queueIndex && speechPlaying) ? toggleSpeechUnified('') : playArticle(item.url, item.title, i)));
+      const num = document.createElement('span');
+      num.className = 'tm-article-number'; num.textContent = `${i + 1}.`;
+      const title = mk('tm-queue-title', item.title, 'Otevřít článek', () => loadArticle(item.url));
+      row.appendChild(num);
+      row.appendChild(title);
+      row.appendChild(mk('tm-q-btn', '▲', 'Posunout nahoru', () => queueMove(i, -1)));
+      row.appendChild(mk('tm-q-btn', '▼', 'Posunout dolů', () => queueMove(i, 1)));
+      row.appendChild(mk('tm-q-btn tm-q-del', '✕', 'Odebrat z fronty', () => queueRemove(i)));
+      list.appendChild(row);
+    });
+    content.querySelector('#tm-q-play').addEventListener('click', playQueue);
+    content.querySelector('#tm-q-clear').addEventListener('click', () => { if (!queue.length || confirm('Vyčistit celou frontu?')) queueClear(); });
+    bindTtsOptions();
+    content.scrollTop = scroll;
   }
 
   async function populateVoiceSelect() {
@@ -755,8 +983,13 @@
 
     const speechButton = document.getElementById('tm-speech-btn');
     const speechText = getArticleSpeechText(article);
+    viewedArticleUrl = url;
     speechButton.addEventListener('click', () => {
-      currentSpeechUrl = url;
+      if (speechPlaying && currentSpeechUrl !== url) stopSpeech();   // something else is being read
+      if (!speechPlaying) {
+        queueActive = false; queueIndex = -1;
+        currentSpeechUrl = url; currentTitle = article.headline || '';
+      }
       toggleSpeechUnified(speechText);
     });
     bindTtsOptions();
@@ -828,6 +1061,19 @@
     .tm-article-row .tm-article-link { flex:1 1 auto; min-width:0; }
     .tm-row-play { flex:0 0 48px; border-radius:6px; border:1px solid #ddd; background:#fff; font-size:16px; cursor:pointer; }
     .tm-row-play:hover { background:#f0f0f0; }
+    .tm-row-queue-wrap { flex:0 0 40px; display:flex; align-items:center; justify-content:center; border:1px solid #ddd; border-radius:6px; background:#fff; cursor:pointer; }
+    .tm-row-queue { width:20px; height:20px; cursor:pointer; accent-color:#cc0000; }
+    #tm-player { flex:0 0 auto; display:flex; align-items:center; gap:8px; padding:8px 16px; background:#f4f6f8; border-top:1px solid #ddd; }
+    #tm-pl-title { flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:14px; color:#333; }
+    .tm-pl-btn { padding:8px 12px; border-radius:6px; border:1px solid #ddd; background:#fff; cursor:pointer; font-size:15px; }
+    .tm-pl-btn:hover { background:#f0f0f0; }
+    .tm-queue-actions { display:flex; gap:8px; margin-top:10px; }
+    #tm-queue-list { display:flex; flex-direction:column; gap:8px; }
+    .tm-queue-row { display:flex; gap:8px; align-items:center; }
+    .tm-queue-row.current .tm-queue-title { border-color:#cc0000; background:#fff4f4; }
+    .tm-queue-title { flex:1 1 auto; min-width:0; text-align:left; padding:10px; border-radius:6px; border:1px solid #eee; background:#fafafa; cursor:pointer; font-weight:600; }
+    .tm-q-btn { padding:8px 10px; border-radius:6px; border:1px solid #ddd; background:#fff; cursor:pointer; }
+    .tm-q-del:hover { background:#fff0f0; color:#900; }
     .tm-row-play.playing { background:#cc0000; color:#fff; border-color:#b30000; }
     .tm-article-link { text-align:left; padding:10px; border-radius:6px; border:1px solid #eee; background:#fafafa; cursor:pointer; display:flex; gap:10px; align-items:center; }
     .tm-article-number { color:#888; width:36px; flex:0 0 36px; text-align:right; padding-right:8px; }
