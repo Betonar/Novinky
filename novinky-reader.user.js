@@ -1,10 +1,14 @@
 // ==UserScript==
-// @name         Novinky.cz - Clean Reader + Neural TTS
+// @name         Novinky.cz + iDNES.cz - Clean Reader + Neural TTS
 // @namespace    http://tampermonkey.net/
-// @version      3.9
-// @description  Category browser, clean article reader and high-quality Czech neural TTS (Azure) with local fallback.
+// @version      4.3
+// @description  Multi-source (Novinky.cz, iDNES.cz, Aktuálně.cz; launcher at https://example.com/) category browser, clean article reader and high-quality Czech neural TTS (Azure) with local fallback.
 // @author       You
 // @match        *://*.novinky.cz/*
+// @match        *://*.idnes.cz/*
+// @match        *://*.aktualne.cz/*
+// @match        https://example.com/*
+// @noframes
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -13,6 +17,11 @@
 // @connect      tts.speech.microsoft.com
 // @connect      germanywestcentral.tts.speech.microsoft.com
 // @connect      westeurope.tts.speech.microsoft.com
+// @connect      novinky.cz
+// @connect      www.novinky.cz
+// @connect      idnes.cz
+// @connect      www.idnes.cz
+// @connect      aktualne.cz
 // @connect      127.0.0.1
 // @connect      localhost
 // @run-at       document-idle
@@ -74,20 +83,234 @@
   });
 
   // ===========================
-  // CATEGORY MAPPING
+  // SOURCES (one entry per news site)
   // ===========================
-  const categories = {
-    "Titulka (Hlavní)": "/",
-    "Stalo se": "/stalo-se",
-    "Domácí": "/domaci",
-    "Volby": "/volby",
-    "Zahraniční": "/zahranicni",
-    "Válka na Ukrajině": "/valka-na-ukrajine",
-    "Komentáře": "/komentare",
-    "Krimi": "/krimi",
-    "Ekonomika": "/ekonomika"
+  // To add a site: add an entry here (domain, origin, categories, extractArticles, extractArticle)
+  // and an @match / @connect line in the header.
+  const normText = t => String(t ?? '').replace(/\s+/g, ' ').trim();
+
+  const SOURCES = {
+    novinky: {
+      name: 'Novinky.cz',
+      domain: 'novinky.cz',
+      origin: 'https://www.novinky.cz',
+      categories: {
+        "Titulka (Hlavní)": "/",
+        "Stalo se": "/stalo-se",
+        "Domácí": "/domaci",
+        "Volby": "/volby",
+        "Zahraniční": "/zahranicni",
+        "Válka na Ukrajině": "/valka-na-ukrajine",
+        "Komentáře": "/komentare",
+        "Krimi": "/krimi",
+        "Ekonomika": "/ekonomika"
+      },
+      extractArticles(doc, origin) {
+        const articles = [];
+        const seenUrls = new Set();
+        const links = doc.querySelectorAll('a[href*="/clanek/"]');
+        links.forEach(link => {
+          if (link.closest('.section-box, .box, .external-box, footer')) return;
+          const rawHref = link.getAttribute('href');
+          if (!rawHref) return;
+          const url = absoluteUrl(rawHref, origin);
+          if (seenUrls.has(url)) return;
+          const titleEl = link.querySelector('h1, h2, h3, h4, h5, h6, [class*="headline"], [class*="title"]');
+          let title = titleEl ? titleEl.textContent.trim() : link.textContent.trim();
+          title = title.replace(/\s+/g, ' ').trim();
+          if (!title || title.length < 10) return;
+          seenUrls.add(url);
+          articles.push({ title, url });
+        });
+        return articles;
+      },
+      extractArticle(doc) {
+        let headline = '';
+        const h1Node = doc.querySelector('h1');
+        const metaTitle = doc.querySelector('meta[property="og:title"]');
+        if (h1Node && h1Node.innerText.trim()) {
+          headline = h1Node.innerText.trim();
+        } else if (metaTitle && metaTitle.getAttribute('content')) {
+          headline = metaTitle.getAttribute('content').replace(/\s*-\s*Novinky\s*$/i, '').trim();
+        } else {
+          headline = doc.title || '';
+        }
+
+        let perexText = '';
+        const perexNode = doc.querySelector('[data-dot="perex"], [class*="perex"], .article-perex');
+        const metaDescription = doc.querySelector('meta[name="description"], meta[property="og:description"]');
+        if (perexNode && perexNode.innerText.trim()) {
+          perexText = perexNode.innerText.trim();
+        } else if (metaDescription && metaDescription.getAttribute('content')) {
+          perexText = metaDescription.getAttribute('content').trim();
+        }
+
+        const articleContainer = doc.querySelector('article') || doc.querySelector('[data-dot="content"]');
+        let paragraphs = [];
+        if (articleContainer) {
+          paragraphs = Array.from(articleContainer.querySelectorAll('p')).map(p => p.innerText.trim()).filter(text => text.length > 0 && text !== perexText);
+        } else {
+          paragraphs = Array.from(doc.querySelectorAll('p')).map(p => p.innerText.trim()).filter(text => text.length > 0 && text !== perexText);
+        }
+        paragraphs = [...new Set(paragraphs)];
+        return { headline, perexText, paragraphs };
+      }
+    },
+
+    idnes: {
+      name: 'iDNES.cz',
+      domain: 'idnes.cz',
+      origin: 'https://www.idnes.cz',
+      categories: {
+        "Titulka (Hlavní)": "/",
+        "Zprávy": "/zpravy",
+        "Domácí": "/zpravy/domaci",
+        "Zahraničí": "/zpravy/zahranicni",
+        "Krimi": "/zpravy/cerna-kronika",
+        "Ekonomika": "/ekonomika",
+        "Finance": "/finance",
+        "Kultura": "/kultura",
+        "Sport": "/sport",
+        "Technet": "/technet"
+      },
+      // Article URLs look like /zpravy/domaci/titulek.A261009_214210_domaci_abc
+      extractArticles(doc, origin) {
+        const articles = [];
+        const seenUrls = new Set();
+        const idRe = /\.A\d{6}_\d{6}_/;
+        doc.querySelectorAll('a[href]').forEach(link => {
+          const rawHref = link.getAttribute('href');
+          if (!rawHref || !idRe.test(rawHref)) return;
+          if (link.closest('footer, nav, header')) return;
+          const titleEl = link.querySelector('h1, h2, h3, h4');
+          if (!titleEl) return;                       // thumbnail / duplicate links have no heading
+          const url = absoluteUrl(rawHref, origin);
+          if (seenUrls.has(url)) return;
+          // other subdomains (e.g. sdeleni.idnes.cz = paid press releases) are not news
+          try { if (!/^(www\.)?idnes\.cz$/.test(new URL(url).hostname)) return; } catch { return; }
+          const title = normText(titleEl.textContent);
+          if (!title || title.length < 10) return;
+          seenUrls.add(url);
+          articles.push({ title, url });
+        });
+        return articles;
+      },
+      extractArticle(doc) {
+        const h1Node = doc.querySelector('h1.arttit') || doc.querySelector('h1');
+        const metaTitle = doc.querySelector('meta[property="og:title"]');
+        let headline = h1Node ? normText(h1Node.textContent) : '';
+        if (!headline && metaTitle) headline = normText(metaTitle.getAttribute('content')).replace(/\s*-\s*iDNES\.cz\s*$/i, '');
+        if (!headline) headline = normText(doc.title);
+
+        let perexText = '';
+        const perexNode = doc.querySelector('.opener');
+        const metaDescription = doc.querySelector('meta[property="og:description"], meta[name="description"]');
+        if (perexNode && normText(perexNode.textContent)) {
+          perexText = normText(perexNode.textContent);
+        } else if (metaDescription) {
+          perexText = normText(metaDescription.getAttribute('content'));
+        }
+
+        // Related-article tables, ads, paywall box and tag list are skipped.
+        const body = doc.querySelector('#art-text') || doc.querySelector('.art-full');
+        let paragraphs = [];
+        if (body) {
+          paragraphs = Array.from(body.querySelectorAll('p, h2, h3'))
+            .filter(p => !p.closest('table, .paywall, [data-redistribute], .r-main, .artend, .tag-list, .blockquote-box, aside'))
+            .map(p => normText(p.textContent))
+            .filter(text => text.length > 0 && text !== perexText);
+          // Premium articles: only the beginning is public
+          if (body.querySelector('.paywall')) paragraphs.push('Zbytek článku je jen pro předplatitele iDNES Premium.');
+        }
+        paragraphs = [...new Set(paragraphs)];
+        return { headline, perexText, paragraphs };
+      }
+    }
   };
 
+  SOURCES.aktualne = {
+    name: 'Aktuálně.cz',
+    domain: 'aktualne.cz',
+    origin: 'https://www.aktualne.cz',
+    // full URLs: sections live on different subdomains
+    categories: {
+      "Titulka (Hlavní)": "https://www.aktualne.cz/",
+      "Zprávy": "https://zpravy.aktualne.cz/",
+      "Domácí": "https://zpravy.aktualne.cz/domaci/",
+      "Zahraničí": "https://zpravy.aktualne.cz/zahranici/",
+      "Ekonomika": "https://zpravy.aktualne.cz/ekonomika/",
+      "Sport": "https://sport.aktualne.cz/",
+      "Kultura": "https://magazin.aktualne.cz/kultura/"
+    },
+    // Article URLs end with /r~<32 hex>/ ; the link sits inside the heading (h2 > a)
+    extractArticles(doc, origin) {
+      const articles = [];
+      const seenUrls = new Set();
+      const idRe = /\/r~[0-9a-f]{32}\/?/;
+      doc.querySelectorAll('a[href]').forEach(link => {
+        const rawHref = link.getAttribute('href');
+        if (!rawHref || !idRe.test(rawHref)) return;
+        if (link.closest('footer, nav, header')) return;
+        const heading = link.closest('h1, h2, h3, h4') || link.querySelector('h1, h2, h3, h4');
+        if (!heading) return;                          // image / duplicate links have no heading
+        const url = absoluteUrl(rawHref, origin).replace(/[?#].*$/, '');
+        if (seenUrls.has(url)) return;
+        try { if (!/(^|\.)aktualne\.cz$/.test(new URL(url).hostname)) return; } catch { return; }
+        const clone = heading.cloneNode(true);
+        clone.querySelectorAll('span.e-data-layer-trigger, script, style').forEach(x => x.remove());
+        const title = normText(clone.textContent);
+        if (!title || title.length < 10) return;
+        seenUrls.add(url);
+        articles.push({ title, url });
+      });
+      return articles;
+    },
+    extractArticle(doc) {
+      const h1Node = doc.querySelector('h1');
+      const metaTitle = doc.querySelector('meta[property="og:title"]');
+      let headline = h1Node ? normText(h1Node.textContent) : '';
+      if (!headline && metaTitle) headline = normText(metaTitle.getAttribute('content')).replace(/\s*[–-]\s*Aktuálně\.cz\s*$/i, '');
+      if (!headline) headline = normText(doc.title);
+
+      let perexText = '';
+      const perexNode = doc.querySelector('.e-web-aktualne-articles-show-header__perex');
+      const metaDescription = doc.querySelector('meta[property="og:description"], meta[name="description"]');
+      if (perexNode && normText(perexNode.textContent)) {
+        perexText = normText(perexNode.textContent);
+      } else if (metaDescription) {
+        perexText = normText(metaDescription.getAttribute('content'));
+      }
+
+      // Direct children only: embeds, ad wrappers and related boxes are nested elsewhere.
+      const body = doc.querySelector('.f-tiptap-content__root');
+      let paragraphs = [];
+      if (body) {
+        paragraphs = Array.from(body.querySelectorAll(':scope > p, :scope > h2, :scope > h3'))
+          .map(p => normText(p.textContent))
+          .filter(text => text.length > 0 && text !== perexText && !/^(Viděli jste|Čtěte také|Přečtěte si)/i.test(text));
+      }
+      paragraphs = [...new Set(paragraphs)];
+      return { headline, perexText, paragraphs };
+    }
+  };
+
+  const findSource = url => {
+    let host = '';
+    try { host = new URL(url, location.href).hostname; } catch { /* ignore */ }
+    return Object.values(SOURCES).find(s => host === s.domain || host.endsWith('.' + s.domain));
+  };
+  const sourceForUrl = url => findSource(url) || SOURCES.novinky;
+
+  // Launcher mode: the reader runs on a neutral page (bookmark it), so no news site has to be visited.
+  // All fetches then go through GM_xmlhttpRequest (different origin).
+  const LAUNCHER_HOST = 'example.com';
+  const isLauncher = location.hostname === LAUNCHER_HOST;
+  const lastSourceId = () => { const id = GM_getValue('lastSource', 'novinky'); return SOURCES[id] ? id : 'novinky'; };
+  // On the source's own site use the real origin (same behaviour as before), elsewhere its default.
+  const sourceOrigin = src => (location.hostname === src.domain || location.hostname.endsWith('.' + src.domain)) ? location.origin : src.origin;
+
+  // opens on the site you are on; on the launcher page on the last used source
+  let currentSource = findSource(location.href) || SOURCES[lastSourceId()];
   let currentCategoryPath = "/";
   let currentCategoryButton = null;
 
@@ -137,75 +360,66 @@
       .replace(/'/g, '&#039;');
   }
 
-  function absoluteUrl(href) {
+  function absoluteUrl(href, base) {
     try {
-      return new URL(href, window.location.origin).href;
+      return new URL(href, base || window.location.origin).href;
     } catch {
       return href;
     }
   }
 
+  // iDNES is windows-1250: bytes must be decoded by the page's charset, not as UTF-8.
+  function decodeHtml(buf, contentType) {
+    let cs = (/charset=["']?([\w-]+)/i.exec(contentType || '') || [])[1];
+    if (!cs) {
+      const head = new TextDecoder('latin1').decode(buf.slice(0, 2048));
+      cs = (/<meta[^>]+charset=["']?([\w-]+)/i.exec(head) || [])[1];
+    }
+    try { return new TextDecoder(cs || 'utf-8').decode(buf); }
+    catch { return new TextDecoder('utf-8').decode(buf); }
+  }
+
+  const CONSENT_RE = /nastaveni-souhlasu/i;
+  function consentError(src) {
+    return new Error(`${src.name} vyžaduje souhlas s cookies. Otevřete ${src.origin} v prohlížeči, klikněte „Souhlasím“ a zkuste to znovu.`);
+  }
+
+  // Same origin: plain fetch (as before). Other site: GM_xmlhttpRequest (cross-origin, cookies of that site).
   async function fetchDocument(url) {
-    const response = await fetch(url, { credentials: 'same-origin', cache: 'no-cache' });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const html = await response.text();
-    return new DOMParser().parseFromString(html, 'text/html');
+    const src = sourceForUrl(url);
+    let buf, contentType, finalUrl;
+    if (new URL(url, location.href).origin === location.origin) {
+      const response = await fetch(url, { credentials: 'same-origin', cache: 'no-cache' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      buf = await response.arrayBuffer();
+      contentType = response.headers.get('content-type');
+      finalUrl = response.url;
+    } else {
+      const r = await new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url,
+          responseType: 'arraybuffer',
+          timeout: 30000,
+          onload: resolve,
+          onerror: () => reject(new Error(`${src.name}: síťová chyba / blokováno (povolte připojení v Tampermonkey)`)),
+          ontimeout: () => reject(new Error(`${src.name}: timeout`))
+        });
+      });
+      if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status}`);
+      buf = r.response;
+      contentType = (/content-type:\s*([^\r\n]+)/i.exec(r.responseHeaders || '') || [])[1];
+      finalUrl = r.finalUrl || url;
+    }
+    if (CONSENT_RE.test(finalUrl)) throw consentError(src);
+    return new DOMParser().parseFromString(decodeHtml(buf, contentType), 'text/html');
   }
 
   // ===========================
-  // EXTRACT ARTICLES / ARTICLE
+  // EXTRACT ARTICLES / ARTICLE (per source, see SOURCES)
   // ===========================
-  function extractArticles(doc) {
-    const articles = [];
-    const seenUrls = new Set();
-    const links = doc.querySelectorAll('a[href*="/clanek/"]');
-    links.forEach(link => {
-      if (link.closest('.section-box, .box, .external-box, footer')) return;
-      const rawHref = link.getAttribute('href');
-      if (!rawHref) return;
-      const url = absoluteUrl(rawHref);
-      if (seenUrls.has(url)) return;
-      const titleEl = link.querySelector('h1, h2, h3, h4, h5, h6, [class*="headline"], [class*="title"]');
-      let title = titleEl ? titleEl.textContent.trim() : link.textContent.trim();
-      title = title.replace(/\s+/g, ' ').trim();
-      if (!title || title.length < 10) return;
-      seenUrls.add(url);
-      articles.push({ title, url });
-    });
-    return articles;
-  }
-
-  function extractArticle(doc) {
-    let headline = '';
-    const h1Node = doc.querySelector('h1');
-    const metaTitle = doc.querySelector('meta[property="og:title"]');
-    if (h1Node && h1Node.innerText.trim()) {
-      headline = h1Node.innerText.trim();
-    } else if (metaTitle && metaTitle.getAttribute('content')) {
-      headline = metaTitle.getAttribute('content').replace(/\s*-\s*Novinky\s*$/i, '').trim();
-    } else {
-      headline = doc.title || '';
-    }
-
-    let perexText = '';
-    const perexNode = doc.querySelector('[data-dot="perex"], [class*="perex"], .article-perex');
-    const metaDescription = doc.querySelector('meta[name="description"], meta[property="og:description"]');
-    if (perexNode && perexNode.innerText.trim()) {
-      perexText = perexNode.innerText.trim();
-    } else if (metaDescription && metaDescription.getAttribute('content')) {
-      perexText = metaDescription.getAttribute('content').trim();
-    }
-
-    const articleContainer = doc.querySelector('article') || doc.querySelector('[data-dot="content"]');
-    let paragraphs = [];
-    if (articleContainer) {
-      paragraphs = Array.from(articleContainer.querySelectorAll('p')).map(p => p.innerText.trim()).filter(text => text.length > 0 && text !== perexText);
-    } else {
-      paragraphs = Array.from(doc.querySelectorAll('p')).map(p => p.innerText.trim()).filter(text => text.length > 0 && text !== perexText);
-    }
-    paragraphs = [...new Set(paragraphs)];
-    return { headline, perexText, paragraphs };
-  }
+  const extractArticles = (doc, src) => src.extractArticles(doc, sourceOrigin(src));
+  const extractArticle = (doc, url) => sourceForUrl(url).extractArticle(doc);
 
   // ===========================
   // TTS: Azure neural voice
@@ -566,12 +780,13 @@
       <div id="tm-header">
         <div id="tm-left-header">
           <button id="tm-back-btn" class="tm-header-btn" type="button" style="display:none;">← Zpět na články</button>
-          <div id="tm-title">Novinky – Text Reader</div>
+          <div id="tm-title">Text Reader</div>
         </div>
         <div id="tm-right-header">
           <button id="tm-close-btn" class="tm-header-btn" type="button">✕ Zavřít</button>
         </div>
       </div>
+      <div id="tm-sources"></div>
       <div id="tm-nav"></div>
       <div id="tm-content"></div>
       <div id="tm-player" style="display:none;">
@@ -587,14 +802,17 @@
     document.body.appendChild(overlay);
 
     const nav = overlay.querySelector('#tm-nav');
-    Object.entries(categories).forEach(([name, path]) => {
+    const sourcesBar = overlay.querySelector('#tm-sources');
+    Object.entries(SOURCES).forEach(([id, src]) => {
       const button = document.createElement('button');
-      button.className = 'tm-nav-btn';
+      button.className = 'tm-src-btn' + (src === currentSource ? ' active' : '');
       button.type = 'button';
-      button.textContent = name;
-      button.addEventListener('click', () => loadCategory(path, button));
-      nav.appendChild(button);
+      button.textContent = src.name;
+      button.dataset.source = id;
+      button.addEventListener('click', () => switchSource(src));
+      sourcesBar.appendChild(button);
     });
+    buildNav();
 
     overlay.querySelector('#tm-close-btn').addEventListener('click', () => {
       stopAll();
@@ -634,10 +852,35 @@
       overlay.style.display = 'flex';
       if (!currentCategoryButton) {
         const firstButton = nav.firstElementChild;
-        loadCategory('/', firstButton);
+        loadCategory(firstButton.dataset.path, firstButton);
       }
     });
     document.body.appendChild(trigger);
+  }
+
+  function buildNav() {
+    const nav = document.getElementById('tm-nav');
+    nav.innerHTML = '';
+    Object.entries(currentSource.categories).forEach(([name, path]) => {
+      const button = document.createElement('button');
+      button.className = 'tm-nav-btn';
+      button.type = 'button';
+      button.textContent = name;
+      button.dataset.path = path;
+      button.addEventListener('click', () => loadCategory(path, button));
+      nav.appendChild(button);
+    });
+  }
+
+  function switchSource(src) {
+    if (src === currentSource && currentCategoryButton) { showArticleList(); return; }
+    currentSource = src;
+    GM_setValue('lastSource', Object.keys(SOURCES).find(id => SOURCES[id] === src));
+    currentCategoryButton = null;
+    document.querySelectorAll('.tm-src-btn').forEach(b => b.classList.toggle('active', SOURCES[b.dataset.source] === src));
+    buildNav();
+    const first = document.querySelector('.tm-nav-btn');
+    loadCategory(first.dataset.path, first);
   }
 
   function setArticleMode(isArticle) {
@@ -667,18 +910,18 @@
     currentCategoryPath = path;
     currentCategoryButton = activeBtn || currentCategoryButton;
     setArticleMode(false);
-    setHeaderTitle(activeBtn ? activeBtn.textContent : 'Novinky – Text Reader');
+    setHeaderTitle(activeBtn ? `${currentSource.name} – ${activeBtn.textContent}` : 'Text Reader');
     document.querySelectorAll('.tm-nav-btn').forEach(button => button.classList.remove('active'));
     if (activeBtn) activeBtn.classList.add('active');
     content.innerHTML = `<div class="tm-loader">Načítám články…</div>`;
     try {
       let docToParse;
-      if (path === '/' && window.location.pathname === '/') {
+      if (currentSource === SOURCES.novinky && path === '/' && window.location.pathname === '/' && findSource(location.href) === currentSource) {
         docToParse = document;
       } else {
-        docToParse = await fetchDocument(window.location.origin + path);
+        docToParse = await fetchDocument(/^https?:/i.test(path) ? path : sourceOrigin(currentSource) + path);
       }
-      const articles = extractArticles(docToParse);
+      const articles = extractArticles(docToParse, currentSource);
       renderArticles(articles, content);
     } catch (error) {
       content.innerHTML = `<div class="tm-error">Chyba při načítání článků:<br>${escapeHTML(error.message)}</div>`;
@@ -749,7 +992,7 @@
     content.innerHTML = `<div class="tm-loader">Načítám článek…</div>`;
     try {
       const doc = await fetchDocument(url);
-      const article = extractArticle(doc);
+      const article = extractArticle(doc, url);
       renderArticle(article, url);
     } catch (error) {
       setHeaderTitle('Chyba');
@@ -815,7 +1058,7 @@
     try {
       const doc = await fetchDocument(url);
       if (token !== listPlayToken) return;
-      const text = getArticleSpeechText(extractArticle(doc));
+      const text = getArticleSpeechText(extractArticle(doc, url));
       if (!text) throw new Error('Text článku se nepodařilo najít');
       await toggleSpeechUnified(text);
     } catch (err) {
@@ -1075,7 +1318,7 @@
       loadCategory(currentCategoryPath, currentCategoryButton);
     } else {
       const firstButton = document.querySelector('.tm-nav-btn');
-      loadCategory('/', firstButton);
+      loadCategory(firstButton.dataset.path, firstButton);
     }
   }
 
@@ -1124,6 +1367,9 @@
     }
     #tm-left-header { display:flex; align-items:center; gap:14px; min-width:0; }
     #tm-title { font-size:18px; font-weight:bold; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    #tm-sources { display:flex; gap:8px; padding:8px 20px 0; background:#fff; }
+    .tm-src-btn { padding:6px 14px; border-radius:16px; border:1px solid #bbb; background:#f4f6f8; cursor:pointer; font-weight:bold; }
+    .tm-src-btn.active { background:#111; color:#fff; border-color:#111; }
     #tm-nav { display:flex; gap:8px; padding:10px 20px; flex-wrap:wrap; background:#fff; border-bottom:1px solid #eee; }
     .tm-nav-btn { padding:8px 12px; border-radius:6px; border:1px solid #ddd; background:#fff; cursor:pointer; }
     .tm-nav-btn.active { background:#cc0000; color:#fff; border-color:#b30000; }
@@ -1165,6 +1411,34 @@
     .tm-voice-select { padding:6px; border-radius:6px; border:1px solid #ddd; background:#fff; }
     .tm-rate-wrap { display:inline-flex; align-items:center; gap:6px; font-size:13px; color:#444; }
     .tm-error { color:#900; background:#fff0f0; padding:12px; border-radius:6px; border:1px solid #f2caca; }
+
+    /* phone layout (Firefox for Android) */
+    @media (max-width: 700px) {
+      #tm-header { padding:8px 12px; gap:8px; }
+      #tm-title { font-size:15px; }
+      #tm-sources { padding:8px 12px 0; overflow-x:auto; }
+      .tm-src-btn { flex:0 0 auto; padding:8px 14px; }
+      #tm-nav { flex-wrap:nowrap; overflow-x:auto; padding:8px 12px; }
+      .tm-nav-btn { flex:0 0 auto; padding:10px 14px; white-space:nowrap; }
+      #tm-content { padding:12px; }
+      .tm-tts-controls { flex-wrap:wrap; gap:8px; }
+      .tm-voice-select { max-width:100%; flex:1 1 100%; padding:10px; font-size:15px; }
+      .tm-rate-wrap { flex:1 1 100%; }
+      .tm-rate-wrap input { flex:1 1 auto; }
+      .tm-row-play { flex:0 0 44px; }
+      .tm-row-queue-wrap { flex:0 0 36px; }
+      .tm-article-link { padding:8px; gap:4px; }
+      .tm-article-number { width:26px; flex:0 0 26px; padding-right:4px; }
+      .tm-article-title { font-size:15px; }
+      .tm-article-body p { font-size:17px; line-height:1.55; }
+      #tm-player { flex-wrap:wrap; padding:8px 12px; gap:6px; }
+      #tm-pl-title { flex:1 1 100%; order:-1; }
+      #tm-pl-seek { flex:1 1 120px; }
+      .tm-pl-btn { padding:10px 14px; }
+      .tm-queue-row { flex-wrap:wrap; }
+      .tm-queue-title { flex:1 1 60%; }
+      #tm-trigger-btn { bottom:16px; left:16px; padding:14px 18px; }
+    }
   `);
 
   // ===========================
@@ -1172,7 +1446,11 @@
   // ===========================
   buildUI();
 
-  // Auto-open overlay if you want (disabled)
-  // document.getElementById('tm-clean-overlay').style.display = 'flex';
+  if (isLauncher) {
+    document.title = 'Čtečka zpráv';
+    document.getElementById('tm-trigger-btn').click();               // open straight away
+    document.getElementById('tm-trigger-btn').style.display = 'none';
+    document.getElementById('tm-close-btn').style.display = 'none';   // nothing to return to
+  }
 
 })();
