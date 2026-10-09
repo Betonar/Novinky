@@ -47,7 +47,6 @@
   // ===========================
   // CATEGORY MAPPING
   // ===========================
-  // ===========================
   const categories = {
     "Titulka (Hlavní)": "/",
     "Stalo se": "/stalo-se",
