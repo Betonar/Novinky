@@ -4,12 +4,17 @@ rem Needs Python 3.9+ (python.org installer, or the Python Install Manager: "py 
 cd /d "%~dp0"
 
 set PY=
-where py >nul 2>nul && set PY=py -3
-if "%PY%"=="" (where python >nul 2>nul && set PY=python)
-if "%PY%"=="" (
-  echo Python was not found. Install it first ^(py install 3.13^) and run this again.
+rem Piper needs onnxruntime, which has no wheels for the newest Python versions - prefer 3.12.
+for %%V in (3.12 3.11 3.13 3.10) do (
+  if not defined PY (
+    py -%%V -c "import sys" >nul 2>nul && set PY=py -%%V
+  )
+)
+if not defined PY (
+  echo Compatible Python not found. Run:  py install 3.12   then start this again.
   goto :fail
 )
+echo Using %PY%
 
 if not exist venv\Scripts\python.exe (
   echo Creating virtual environment...
