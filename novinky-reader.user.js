@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Novinky.cz - Clean Reader + Neural TTS
 // @namespace    http://tampermonkey.net/
-// @version      3.3
+// @version      3.5
 // @description  Category browser, clean article reader and high-quality Czech neural TTS (Azure) with local fallback.
 // @author       You
 // @match        *://*.novinky.cz/*
@@ -13,6 +13,8 @@
 // @connect      tts.speech.microsoft.com
 // @connect      germanywestcentral.tts.speech.microsoft.com
 // @connect      westeurope.tts.speech.microsoft.com
+// @connect      127.0.0.1
+// @connect      localhost
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -35,7 +37,13 @@
     freeLimit: 500000                      // Azure F0 free tier, characters / month
   };
   const VOICES = { 'cs-CZ-VlastaNeural': 'Vlasta (žena)', 'cs-CZ-AntoninNeural': 'Antonín (muž)' };
-  const getVoice = () => GM_getValue('voice', TTS.voice);
+  // Voice selection: 'azure:<voice>' (cloud, counts against free tier)
+  // or 'local:<voiceURI>' / 'local:auto' (browser / system voices, free, unlimited).
+  const getSel = () => GM_getValue('voiceSel', getKey() ? 'azure:' + TTS.voice : 'local:auto');
+  const isAzureSel = () => getSel().startsWith('azure:');
+  const isPiperSel = () => getSel().startsWith('piper:');
+  const PIPER_URL = 'http://127.0.0.1:5000/synthesize';   // see piper-server/start-piper.bat
+  const getVoice = () => isAzureSel() ? getSel().slice(6) : TTS.voice;
   const getRate = () => Number(GM_getValue('rate', TTS.rate)) || 1;
 
   // Locally counted characters sent to Azure this calendar month (this browser only).
@@ -190,6 +198,7 @@
 
   // Returns a blob: URL with MP3 audio for one chunk of text.
   function synthesizeChunk(text) {
+    if (isPiperSel()) return synthesizePiper(text);
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'POST',
@@ -210,6 +219,25 @@
         },
         onerror: e => reject(new Error('síťová chyba / blokováno (' + ((e && e.error) || 'povolte připojení v Tampermonkey') + ')')),
         ontimeout: () => reject(new Error('Azure TTS timeout'))
+      });
+    });
+  }
+
+  // Local Piper server (offline, free): POST {text} -> WAV
+  function synthesizePiper(text) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: PIPER_URL,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify({ text }),
+        responseType: 'arraybuffer',
+        timeout: 60000,
+        onload: r => r.status === 200
+          ? resolve(URL.createObjectURL(new Blob([r.response], { type: 'audio/wav' })))
+          : reject(new Error(`Piper HTTP ${r.status}`)),
+        onerror: () => reject(new Error('Piper server neběží (spusťte start-piper.bat)')),
+        ontimeout: () => reject(new Error('Piper timeout'))
       });
     });
   }
@@ -264,7 +292,13 @@
 
   async function chooseVoice() {
     const voices = await loadVoices();
-    const preferredKeys = ['neural', 'google', 'microsoft', 'premium', 'cs-cz', 'cs', 'czech'];
+    const sel = getSel();
+    if (sel.startsWith('local:') && sel !== 'local:auto') {
+      const wanted = sel.slice(6);
+      const chosen = voices.find(v => v.voiceURI === wanted || v.name === wanted);
+      if (chosen) return chosen;
+    }
+    const preferredKeys = ['natural', 'neural', 'online', 'google', 'microsoft', 'premium', 'cs-cz', 'cs', 'czech'];
     // Try to find voice by name keywords and cs language
     for (const key of preferredKeys) {
       const found = voices.find(v => v.lang && v.lang.toLowerCase().startsWith('cs') && v.name && v.name.toLowerCase().includes(key));
@@ -339,8 +373,8 @@
       speechUtterance.lang = 'cs-CZ';
     }
     // Gentle settings
-    speechUtterance.rate = 0.98;
-    speechUtterance.pitch = 0.95;
+    speechUtterance.rate = getRate();
+    speechUtterance.pitch = 1.0;
     speechUtterance.volume = 1.0;
 
     speechUtterance.onend = function () {
@@ -384,7 +418,7 @@
 
     const session = ++ttsSession;
     lastTtsError = '';
-    if (getKey()) {
+    if ((getKey() && isAzureSel()) || isPiperSel()) {
       try {
         await startNeuralSpeech(text, session);
         return;
@@ -395,7 +429,7 @@
         lastTtsError = err && err.message ? err.message : String(err);
       }
     } else {
-      console.info('Azure key not set (Tampermonkey menu), using local TTS.');
+      // local voice selected (or no Azure key)
     }
     useExternalThisSession = false;
     await startLocalSpeech(text);
@@ -417,7 +451,7 @@
       button.classList.remove('playing');
     }
     if (modeLabel) {
-      modeLabel.textContent = lastTtsError && !useExternalThisSession ? `Lokální TTS – Azure selhal: ${lastTtsError}` : !getKey() ? 'Lokální TTS (chybí Azure klíč)' : (useExternalThisSession ? 'Neurální hlas (Azure)' : 'Neurální hlas (Azure) – připraven');
+      modeLabel.textContent = isPiperSel() ? (lastTtsError && !useExternalThisSession ? `Lokální hlas – Piper selhal: ${lastTtsError}` : 'Piper (offline)') : !isAzureSel() ? 'Hlas prohlížeče / systému' : lastTtsError && !useExternalThisSession ? `Lokální TTS – Azure selhal: ${lastTtsError}` : !getKey() ? 'Lokální TTS (chybí Azure klíč)' : (useExternalThisSession ? 'Neurální hlas (Azure)' : 'Neurální hlas (Azure) – připraven');
     }
   }
 
@@ -576,6 +610,28 @@
     return parts.filter(Boolean).join('\n\n');
   }
 
+  async function populateVoiceSelect() {
+    const select = document.getElementById('tm-voice-select');
+    if (!select) return;
+    const voices = await loadVoices();
+    let local = voices.filter(v => /^(cs|sk)/i.test(v.lang || ''));
+    if (!local.length) local = voices;
+    const opt = (value, label) => `<option value="${escapeHTML(value)}">${escapeHTML(label)}</option>`;
+    let html = '';
+    if (getKey()) {
+      html += `<optgroup label="Azure (limit zdarma)">` +
+        Object.entries(VOICES).map(([id, name]) => opt('azure:' + id, name)).join('') + `</optgroup>`;
+    }
+    html += `<optgroup label="Piper (offline, vlastní server)">` + opt('piper:jirka', 'Jirka (Piper)') + `</optgroup>`;
+    html += `<optgroup label="Prohlížeč / systém (zdarma)">` + opt('local:auto', 'Automaticky (nejlepší dostupný)') +
+      local.map(v => opt('local:' + v.voiceURI, `${v.name} [${v.lang}]`)).join('') + `</optgroup>`;
+    select.innerHTML = html;
+    const sel = getSel();
+    const exists = Array.from(select.options).some(o => o.value === sel);
+    select.value = exists ? sel : 'local:auto';
+    updateSpeechButton();
+  }
+
   function renderArticle(article, url) {
     const content = document.getElementById('tm-content');
     setHeaderTitle(article.headline || 'Článek');
@@ -590,14 +646,12 @@
             <span class="tm-speech-icon">▶</span>
             <span class="tm-speech-label">Přečíst článek</span>
           </button>
-          <select id="tm-voice-select" class="tm-voice-select" title="Hlas">
-            ${Object.entries(VOICES).map(([id, name]) => `<option value="${id}"${id === getVoice() ? ' selected' : ''}>${name}</option>`).join('')}
-          </select>
+          <select id="tm-voice-select" class="tm-voice-select" title="Hlas"></select>
           <label class="tm-rate-wrap" title="Rychlost">
             <input id="tm-rate-range" type="range" min="0.7" max="1.6" step="0.05" value="${getRate()}">
             <span id="tm-rate-label">${getRate().toFixed(2)}×</span>
           </label>
-          <span id="tm-tts-mode-label" class="tm-tts-mode-label">${getKey() ? 'Neurální hlas (Azure)' : 'Lokální TTS (chybí Azure klíč)'}</span>
+          <span id="tm-tts-mode-label" class="tm-tts-mode-label"></span>
         </div>
 
         <div id="tm-usage-label" class="tm-tts-mode-label"></div>
@@ -623,7 +677,13 @@
       // prefer external if enabled
       toggleSpeechUnified(speechText);
     });
-    document.getElementById('tm-voice-select').addEventListener('change', e => GM_setValue('voice', e.target.value));
+    populateVoiceSelect();
+    document.getElementById('tm-voice-select').addEventListener('change', e => {
+      GM_setValue('voiceSel', e.target.value);
+      useExternalThisSession = false;
+      lastTtsError = '';
+      updateSpeechButton();
+    });
     document.getElementById('tm-rate-range').addEventListener('input', e => {
       const v = Number(e.target.value);
       GM_setValue('rate', v);
