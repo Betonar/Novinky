@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Novinky.cz - Clean Reader + Neural TTS
 // @namespace    http://tampermonkey.net/
-// @version      3.6
+// @version      3.7
 // @description  Category browser, clean article reader and high-quality Czech neural TTS (Azure) with local fallback.
 // @author       You
 // @match        *://*.novinky.cz/*
@@ -103,6 +103,9 @@
   let ttsSession = 0;          // bumped on every stop/start to cancel stale async work
   let ttsPaused = false;
   let lastTtsError = '';
+  let currentSpeechUrl = '';   // article currently read (for the list play buttons)
+  let busyUrl = '';            // article being fetched / synthesized
+  let listPlayToken = 0;
 
   // ===========================
   // HELPERS
@@ -440,7 +443,15 @@
   function updateSpeechButton() {
     const button = document.getElementById('tm-speech-btn');
     const modeLabel = document.getElementById('tm-tts-mode-label');
-    if (!button) return;
+    document.querySelectorAll('.tm-row-play').forEach(b => {
+      const mine = b.dataset.url === currentSpeechUrl;
+      b.textContent = mine && speechPlaying ? (ttsPaused ? '▶' : '⏸') : (mine && busyUrl === b.dataset.url ? '…' : '▶');
+      b.classList.toggle('playing', mine && speechPlaying);
+    });
+    if (!button) {
+      if (modeLabel) modeLabel.textContent = modeText();
+      return;
+    }
     if (speechPlaying && !ttsPaused) {
       button.innerHTML = `<span class="tm-speech-icon">⏸</span><span class="tm-speech-label">Pozastavit čtení</span>`;
       button.classList.add('playing');
@@ -451,9 +462,11 @@
       button.innerHTML = `<span class="tm-speech-icon">▶</span><span class="tm-speech-label">Přečíst článek</span>`;
       button.classList.remove('playing');
     }
-    if (modeLabel) {
-      modeLabel.textContent = isPiperSel() ? (lastTtsError && !useExternalThisSession ? `Lokální hlas – Piper selhal: ${lastTtsError}` : 'Piper (offline)') : !isAzureSel() ? 'Hlas prohlížeče / systému' : lastTtsError && !useExternalThisSession ? `Lokální TTS – Azure selhal: ${lastTtsError}` : !getKey() ? 'Lokální TTS (chybí Azure klíč)' : (useExternalThisSession ? 'Neurální hlas (Azure)' : 'Neurální hlas (Azure) – připraven');
-    }
+    if (modeLabel) modeLabel.textContent = modeText();
+  }
+
+  function modeText() {
+    return isPiperSel() ? (lastTtsError && !useExternalThisSession ? `Lokální hlas – Piper selhal: ${lastTtsError}` : 'Piper (offline)') : !isAzureSel() ? 'Hlas prohlížeče / systému' : lastTtsError && !useExternalThisSession ? `Lokální TTS – Azure selhal: ${lastTtsError}` : !getKey() ? 'Lokální TTS (chybí Azure klíč)' : (useExternalThisSession ? 'Neurální hlas (Azure)' : 'Neurální hlas (Azure) – připraven');
   }
 
   // ===========================
@@ -562,9 +575,17 @@
       container.innerHTML = `<div class="tm-error">Nenalezeny žádné články.</div>`;
       return;
     }
+    const bar = document.createElement('div');
+    bar.className = 'tm-list-tts';
+    bar.innerHTML = `<div class="tm-tts-controls">${ttsOptionsHTML()}</div><div id="tm-usage-label" class="tm-tts-mode-label"></div>`;
+    container.appendChild(bar);
+
     const list = document.createElement('div');
     list.id = 'tm-article-list';
     articles.forEach((article, index) => {
+      const row = document.createElement('div');
+      row.className = 'tm-article-row';
+
       const item = document.createElement('button');
       item.type = 'button';
       item.className = 'tm-article-link';
@@ -574,9 +595,22 @@
         <span class="tm-article-title">${escapeHTML(article.title)}</span>
       `;
       item.addEventListener('click', () => loadArticle(article.url));
-      list.appendChild(item);
+
+      const play = document.createElement('button');
+      play.type = 'button';
+      play.className = 'tm-row-play';
+      play.dataset.url = article.url;
+      play.title = 'Přečíst článek bez otevření';
+      play.textContent = '▶';
+      play.addEventListener('click', () => playFromList(article.url));
+
+      row.appendChild(item);
+      row.appendChild(play);
+      list.appendChild(row);
     });
     container.appendChild(list);
+    bindTtsOptions();
+    updateSpeechButton();
   }
 
   async function loadArticle(url) {
@@ -609,6 +643,58 @@
     if (article.perexText) parts.push(article.perexText);
     if (article.paragraphs && article.paragraphs.length) parts.push(...article.paragraphs);
     return parts.filter(Boolean).join('\n\n');
+  }
+
+  function ttsOptionsHTML() {
+    return `
+          <select id="tm-voice-select" class="tm-voice-select" title="Hlas"></select>
+          <label class="tm-rate-wrap" title="Rychlost">
+            <input id="tm-rate-range" type="range" min="0.7" max="1.6" step="0.05" value="${getRate()}">
+            <span id="tm-rate-label">${getRate().toFixed(2)}×</span>
+          </label>
+          <span id="tm-tts-mode-label" class="tm-tts-mode-label"></span>`;
+  }
+
+  function bindTtsOptions() {
+    populateVoiceSelect();
+    document.getElementById('tm-voice-select').addEventListener('change', e => {
+      GM_setValue('voiceSel', e.target.value);
+      useExternalThisSession = false;
+      lastTtsError = '';
+      updateSpeechButton();
+    });
+    document.getElementById('tm-rate-range').addEventListener('input', e => {
+      const v = Number(e.target.value);
+      GM_setValue('rate', v);
+      document.getElementById('tm-rate-label').textContent = v.toFixed(2) + '×';
+      if (audioElement) audioElement.playbackRate = v;
+    });
+    updateUsageLabel();
+  }
+
+  // Play button next to a headline: fetch the article and read it without opening it.
+  async function playFromList(url) {
+    if (speechPlaying && currentSpeechUrl === url) {
+      await toggleSpeechUnified('');          // pause / resume (or stop for local voices)
+      updateSpeechButton();
+      return;
+    }
+    stopSpeech();
+    const token = ++listPlayToken;
+    currentSpeechUrl = url;
+    busyUrl = url;
+    updateSpeechButton();
+    try {
+      const doc = await fetchDocument(url);
+      if (token !== listPlayToken) return;
+      const text = getArticleSpeechText(extractArticle(doc));
+      if (!text) throw new Error('Text článku se nepodařilo najít');
+      await toggleSpeechUnified(text);
+    } catch (err) {
+      if (token === listPlayToken) lastTtsError = err.message || String(err);
+    }
+    if (token === listPlayToken) busyUrl = '';
+    updateSpeechButton();
   }
 
   async function populateVoiceSelect() {
@@ -647,12 +733,7 @@
             <span class="tm-speech-icon">▶</span>
             <span class="tm-speech-label">Přečíst článek</span>
           </button>
-          <select id="tm-voice-select" class="tm-voice-select" title="Hlas"></select>
-          <label class="tm-rate-wrap" title="Rychlost">
-            <input id="tm-rate-range" type="range" min="0.7" max="1.6" step="0.05" value="${getRate()}">
-            <span id="tm-rate-label">${getRate().toFixed(2)}×</span>
-          </label>
-          <span id="tm-tts-mode-label" class="tm-tts-mode-label"></span>
+          ${ttsOptionsHTML()}
         </div>
 
         <div id="tm-usage-label" class="tm-tts-mode-label"></div>
@@ -675,23 +756,10 @@
     const speechButton = document.getElementById('tm-speech-btn');
     const speechText = getArticleSpeechText(article);
     speechButton.addEventListener('click', () => {
-      // prefer external if enabled
+      currentSpeechUrl = url;
       toggleSpeechUnified(speechText);
     });
-    populateVoiceSelect();
-    document.getElementById('tm-voice-select').addEventListener('change', e => {
-      GM_setValue('voiceSel', e.target.value);
-      useExternalThisSession = false;
-      lastTtsError = '';
-      updateSpeechButton();
-    });
-    document.getElementById('tm-rate-range').addEventListener('input', e => {
-      const v = Number(e.target.value);
-      GM_setValue('rate', v);
-      document.getElementById('tm-rate-label').textContent = v.toFixed(2) + '×';
-      if (audioElement) audioElement.playbackRate = v;
-    });
-    updateUsageLabel();
+    bindTtsOptions();
     updateSpeechButton();
   }
 
@@ -755,6 +823,12 @@
     #tm-content { padding:18px; overflow:auto; flex:1 1 auto; }
     .tm-loader { color:#666; font-style:italic; }
     #tm-article-list { display:flex; flex-direction:column; gap:8px; }
+    .tm-list-tts { margin-bottom:12px; }
+    .tm-article-row { display:flex; gap:8px; align-items:stretch; }
+    .tm-article-row .tm-article-link { flex:1 1 auto; min-width:0; }
+    .tm-row-play { flex:0 0 48px; border-radius:6px; border:1px solid #ddd; background:#fff; font-size:16px; cursor:pointer; }
+    .tm-row-play:hover { background:#f0f0f0; }
+    .tm-row-play.playing { background:#cc0000; color:#fff; border-color:#b30000; }
     .tm-article-link { text-align:left; padding:10px; border-radius:6px; border:1px solid #eee; background:#fafafa; cursor:pointer; display:flex; gap:10px; align-items:center; }
     .tm-article-number { color:#888; width:36px; flex:0 0 36px; text-align:right; padding-right:8px; }
     .tm-article-title { font-weight:600; }
