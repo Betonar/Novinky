@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Novinky.cz + iDNES.cz - Clean Reader + Neural TTS
 // @namespace    http://tampermonkey.net/
-// @version      5.1
+// @version      5.2
 // @description  Multi-source (Novinky.cz, iDNES.cz, Aktuálně.cz; launcher at https://example.com/) category browser, clean article reader and high-quality Czech neural TTS (Azure) with local fallback.
 // @author       You
 // @match        *://*.novinky.cz/*
@@ -350,6 +350,7 @@
   let speechTotalChars = 1;
   let speechPos = 0;
   let seekDragging = false;
+  let localResumeAt = -1;       // sentence to continue from after a local-voice pause
 
   // ===========================
   // HELPERS
@@ -509,6 +510,9 @@
       if (session !== ttsSession) { URL.revokeObjectURL(url); return; }
       if (i === 0) { speechPlaying = true; useExternalThisSession = true; updateSpeechButton(); }
       if (i + 1 < chunks.length) { next = synthesizeChunk(chunks[i + 1].text); next.catch(() => {}); }
+      // paused between two chunks: do not start the next one until resumed
+      while (ttsPaused && session === ttsSession) await new Promise(r => setTimeout(r, 250));
+      if (session !== ttsSession) { URL.revokeObjectURL(url); return; }
       setSpeechPos(chunks[i].startChar);
       await playUrl(url, session, chunks[i]);
       URL.revokeObjectURL(url);
@@ -616,9 +620,23 @@
   // Jump to a fraction (0..1) of the article: restart reading from the nearest sentence start.
   async function seekToFraction(f) {
     if (!speechSentences.length || !speechFullText) return;
-    const target = f * speechTotalChars;
+    const k = sentenceAt(f * speechTotalChars);
+    const text = speechFullText;
+    stopSpeech();
+    await toggleSpeechUnified(text, k);
+  }
+
+  // Index of the sentence containing character position pos.
+  function sentenceAt(pos) {
     let k = 0;
-    for (let i = 0; i < speechStarts.length; i++) if (speechStarts[i] <= target) k = i;
+    for (let i = 0; i < speechStarts.length; i++) { if (speechStarts[i] <= pos) k = i; else break; }
+    return k;
+  }
+
+  // Rewind / skip ahead by whole sentences (rewind button, notification and car controls).
+  async function seekBySentences(delta) {
+    if (!speechSentences.length || !speechFullText || !speechPlaying) return;
+    const k = Math.max(0, Math.min(speechSentences.length - 1, sentenceAt(speechPos) + delta));
     const text = speechFullText;
     stopSpeech();
     await toggleSpeechUnified(text, k);
@@ -637,7 +655,7 @@
   async function startLocalSpeech(fromSentence) {
     stopLocalSpeech();
     const session = ttsSession;
-    speechChunks = chunksFrom(fromSentence, 700);
+    speechChunks = chunksFrom(fromSentence, 400);   // short chunks = finer resume point
     if (!speechChunks.length) { speechFinished(); return; }
     speechIndex = 0;
     speechPlaying = true;
@@ -693,6 +711,7 @@
   function stopSpeech() {
     ttsSession++;
     ttsPaused = false;
+    localResumeAt = -1;
     if (audioElement) {
       audioElement.onended = audioElement.onerror = null;
       audioElement.pause();
@@ -703,18 +722,41 @@
     updateSpeechButton();
   }
 
-  async function toggleSpeechUnified(text, fromSentence = 0) {
-    // Pause / resume of the neural audio
-    if (speechPlaying) {
-      if (audioElement) {
-        if (ttsPaused) { await audioElement.play(); ttsPaused = false; }
-        else { audioElement.pause(); ttsPaused = true; }
-      } else if (ttsPaused) {
-        window.speechSynthesis.resume(); ttsPaused = false;
-      } else {
-        window.speechSynthesis.pause(); ttsPaused = true;
-      }
+  // Browser / system voice: Android ignores speechSynthesis.pause(), so pausing cancels the
+  // utterance and remembers the sentence (localResumeAt); resuming reads on from that sentence.
+
+  function pauseSpeech() {
+    if (!speechPlaying || ttsPaused) return;
+    ttsPaused = true;
+    if (useExternalThisSession) {
+      if (audioElement) audioElement.pause();
+    } else {
+      localResumeAt = sentenceAt(speechPos);
+      ttsSession++;                       // ignore onend / onerror of the cancelled utterance
+      window.speechSynthesis.cancel();
+    }
+    updateSpeechButton();
+  }
+
+  async function resumeSpeech() {
+    if (!speechPlaying || !ttsPaused) return;
+    ttsPaused = false;
+    if (useExternalThisSession) {
+      if (audioElement && !audioElement.ended) await audioElement.play().catch(() => {});
       updateSpeechButton();
+      return;
+    }
+    const k = Math.max(0, localResumeAt);
+    localResumeAt = -1;
+    ttsSession++;
+    await startLocalSpeech(k);
+  }
+
+  async function toggleSpeechUnified(text, fromSentence = 0) {
+    // Already reading: pause / resume
+    if (speechPlaying) {
+      if (ttsPaused) await resumeSpeech();
+      else pauseSpeech();
       return;
     }
 
@@ -762,7 +804,9 @@
     book: '<path d="M4 19V5.5A2.5 2.5 0 0 1 6.5 3H20v14H6.5A2.5 2.5 0 0 0 4 19.5 2.5 2.5 0 0 0 6.5 22H20v-5"/>',
     alert: '<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.5v.01"/>',
     chevron: '<path d="M6 9l6 6 6-6"/>',
-    refresh: '<path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"/>'
+    refresh: '<path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"/>',
+    rewind: '<path d="M11.5 6.2v11.6a.7.7 0 0 1-1.1.6L3.2 12.6a.7.7 0 0 1 0-1.2l7.2-5.8a.7.7 0 0 1 1.1.6zM20.5 6.2v11.6a.7.7 0 0 1-1.1.6l-7.2-5.8a.7.7 0 0 1 0-1.2l7.2-5.8a.7.7 0 0 1 1.1.6z" class="tm-fill"/>',
+    car: '<path d="M3.5 17v-3.6l2-5A2 2 0 0 1 7.4 7h9.2a2 2 0 0 1 1.9 1.4l2 5V17z"/><path d="M5.5 17v2.5M18.5 17v2.5M5.2 12.5h13.6"/><circle cx="7.6" cy="14.8" r=".6" class="tm-fill"/><circle cx="16.4" cy="14.8" r=".6" class="tm-fill"/>'
   };
   const icon = name => `<svg class="tm-ic" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${ICON_PATHS[name]}</svg>`;
 
@@ -785,6 +829,7 @@
       if (row) row.classList.toggle('is-current', mine && (speechPlaying || busyUrl === b.dataset.url));
     });
     updatePlayerUI();
+    mediaSync();
     syncQueueChecks();
     const warn = !!lastTtsError && !useExternalThisSession;
     document.querySelectorAll('.tm-mode-text').forEach(el => {
@@ -832,6 +877,7 @@
           <div id="tm-title">Čtečka zpráv</div>
         </div>
         <div id="tm-header-actions">
+          <button id="tm-hd-drive" class="tm-icon-btn" type="button" title="Režim řízení – velká tlačítka" aria-label="Režim řízení">${icon('car')}</button>
           <button id="tm-hd-queue" class="tm-icon-btn" type="button" title="Fronta" aria-label="Fronta">${icon('queue')}<span class="tm-badge tm-q-count" hidden>0</span></button>
           <button id="tm-hd-settings" class="tm-icon-btn" type="button" title="Hlas a rychlost" aria-label="Hlas a rychlost">${icon('settings')}</button>
           <button id="tm-close-btn" class="tm-icon-btn" type="button" title="Zavřít čtečku" aria-label="Zavřít čtečku">${icon('close')}</button>
@@ -860,7 +906,33 @@
         <span id="tm-pl-pos">0 %</span>
         <button id="tm-pl-rate" class="tm-chip" type="button" title="Hlas a rychlost">1.00×</button>
         <button id="tm-pl-queue" class="tm-icon-btn" type="button" title="Fronta" aria-label="Fronta">${icon('queue')}<span class="tm-badge tm-q-count" hidden>0</span></button>
+        <button id="tm-pl-drive" class="tm-icon-btn" type="button" title="Režim řízení – velká tlačítka" aria-label="Režim řízení">${icon('car')}</button>
       </div>
+      <section id="tm-drive" aria-label="Režim řízení">
+        <div class="tm-dr-top">
+          <button id="tm-dr-exit" class="tm-dr-pill" type="button">${icon('close')}<span id="tm-dr-exit-lbl">Zavřít</span></button>
+          <div id="tm-dr-heading" class="tm-dr-heading">Řízení</div>
+          <button id="tm-dr-settings" class="tm-dr-pill" type="button">${icon('settings')}<span>Nastavení</span></button>
+        </div>
+        <div class="tm-dr-player">
+          <div class="tm-dr-now">
+            <div id="tm-dr-meta" class="tm-dr-meta"></div>
+            <div id="tm-dr-title" class="tm-dr-title"></div>
+            <div id="tm-dr-sub" class="tm-dr-sub"></div>
+            <div class="tm-dr-progress"><div class="tm-dr-track"><span id="tm-dr-bar"></span></div><span id="tm-dr-pos">0 %</span></div>
+          </div>
+          <div class="tm-dr-controls">
+            <button id="tm-dr-back" class="tm-dr-btn" type="button"><span class="tm-dr-ic">${icon('rewind')}</span><span class="tm-dr-lbl">Zpět</span></button>
+            <button id="tm-dr-toggle" class="tm-dr-btn tm-dr-main" type="button"><span id="tm-dr-toggle-ic" class="tm-dr-ic"></span><span id="tm-dr-toggle-lbl" class="tm-dr-lbl">Přehrát</span></button>
+            <button id="tm-dr-next" class="tm-dr-btn" type="button"><span class="tm-dr-ic">${icon('next')}</span><span class="tm-dr-lbl">Další</span></button>
+          </div>
+          <div class="tm-dr-bottom">
+            <button id="tm-dr-queue" class="tm-dr-wide" type="button">${icon('queue')}<span>Fronta</span><span class="tm-dr-count tm-q-count" hidden>0</span></button>
+            <button id="tm-dr-stop" class="tm-dr-wide" type="button">${icon('stop')}<span>Stop</span></button>
+          </div>
+        </div>
+        <div class="tm-dr-queue"><div id="tm-dr-qlist" class="tm-dr-qlist"></div></div>
+      </section>
       <div id="tm-sheet-backdrop"></div>
       <section id="tm-sheet" role="dialog" aria-modal="true" aria-labelledby="tm-sheet-title">
         <div class="tm-sheet-grab" aria-hidden="true"></div>
@@ -919,6 +991,7 @@
     overlay.querySelector('#tm-close-btn').addEventListener('click', () => {
       stopAll();
       closeSheet();
+      closeDrive(false);
       overlay.style.display = 'none';
     });
     overlay.querySelector('#tm-back-btn').addEventListener('click', showArticleList);
@@ -929,12 +1002,19 @@
     overlay.querySelector('#tm-sheet-close').addEventListener('click', closeSheet);
     overlay.querySelector('#tm-sheet-backdrop').addEventListener('click', closeSheet);
 
-    overlay.querySelector('#tm-pl-toggle').addEventListener('click', () => {
-      if (speechPlaying) toggleSpeechUnified('');
-      else if (!busyUrl) playQueue();
-    });
+    overlay.querySelector('#tm-pl-toggle').addEventListener('click', togglePlayback);
     overlay.querySelector('#tm-pl-next').addEventListener('click', playNext);
     overlay.querySelector('#tm-pl-stop').addEventListener('click', stopAll);
+    overlay.querySelector('#tm-hd-drive').addEventListener('click', openDrive);
+    overlay.querySelector('#tm-pl-drive').addEventListener('click', openDrive);
+    overlay.querySelector('#tm-dr-exit').addEventListener('click', () => driveQueueOpen ? showDriveQueue(false) : closeDrive());
+    overlay.querySelector('#tm-dr-settings').addEventListener('click', openSheet);
+    overlay.querySelector('#tm-dr-toggle').addEventListener('click', togglePlayback);
+    overlay.querySelector('#tm-dr-back').addEventListener('click', () => seekBySentences(-REWIND_SENTENCES));
+    overlay.querySelector('#tm-dr-next').addEventListener('click', playNext);
+    overlay.querySelector('#tm-dr-stop').addEventListener('click', stopAll);
+    overlay.querySelector('#tm-dr-queue').addEventListener('click', () => showDriveQueue(true));
+    document.addEventListener('visibilitychange', requestWakeLock);
     const seek = overlay.querySelector('#tm-pl-seek');
     seek.addEventListener('input', () => {
       seekDragging = true;
@@ -954,6 +1034,8 @@
     trigger.innerHTML = `${icon('book')}<span>Čtečka</span>`;
     trigger.addEventListener('click', () => {
       overlay.style.display = 'flex';
+      setupMediaSession();                                     // only once the reader is used (sites have own videos)
+      if (GM_getValue('driveMode', false)) openDrive();       // was left in drive mode last time
       if (!currentCategoryButton) {
         const firstButton = nav.firstElementChild;
         loadCategory(firstButton.dataset.path, firstButton);
@@ -962,6 +1044,183 @@
     document.body.appendChild(trigger);
     document.addEventListener('keydown', onKeyDown);
     updatePlayerUI();
+  }
+
+  // Main play/pause button (player bar, drive mode, notification, Space).
+  function togglePlayback() {
+    if (speechPlaying) toggleSpeechUnified('');
+    else if (!busyUrl) playQueue();
+  }
+
+  // ===========================
+  // DRIVE MODE (big buttons, always dark, screen kept on)
+  // ===========================
+  const REWIND_SENTENCES = 2;
+  let driveOpen = false;
+  let driveQueueOpen = false;
+  let wakeLock = null;
+
+  function openDrive() {
+    const overlay = document.getElementById('tm-clean-overlay');
+    driveOpen = true;
+    GM_setValue('driveMode', true);
+    overlay.classList.add('tm-drive-open');
+    showDriveQueue(false);
+    requestWakeLock();
+  }
+
+  function closeDrive(remember = true) {
+    const overlay = document.getElementById('tm-clean-overlay');
+    driveOpen = false;
+    if (remember) GM_setValue('driveMode', false);
+    if (overlay) overlay.classList.remove('tm-drive-open');
+    releaseWakeLock();
+  }
+
+  function showDriveQueue(open) {
+    driveQueueOpen = open;
+    document.getElementById('tm-drive').classList.toggle('tm-dr-q', open);
+    document.getElementById('tm-dr-heading').textContent = open ? 'Fronta' : 'Řízení';
+    document.getElementById('tm-dr-exit-lbl').textContent = open ? 'Zpět' : 'Zavřít';
+    document.getElementById('tm-dr-exit').firstElementChild.outerHTML = icon(open ? 'back' : 'close');
+    if (open) renderDriveQueue();
+    updateDriveUI();
+  }
+
+  async function requestWakeLock() {
+    if (!driveOpen || wakeLock || !navigator.wakeLock || document.visibilityState !== 'visible') return;
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } catch { wakeLock = null; }
+  }
+
+  function releaseWakeLock() {
+    try { if (wakeLock) wakeLock.release(); } catch { /* ignore */ }
+    wakeLock = null;
+  }
+
+  function updateDriveUI() {
+    if (!driveOpen) return;
+    const busy = !!busyUrl;
+    const active = speechPlaying || busy;
+    const state = speechPlaying ? (ttsPaused ? 'paused' : 'playing') : (busy ? 'busy' : 'idle');
+    setPlayState(document.getElementById('tm-dr-toggle-ic'), state);
+    document.getElementById('tm-dr-toggle-lbl').textContent =
+      state === 'playing' ? 'Pauza' : state === 'paused' ? 'Pokračovat' : state === 'busy' ? 'Načítám…' : 'Přehrát';
+    const meta = active
+      ? [sourceForUrl(currentSpeechUrl).name, queueActive ? `Fronta ${queueIndex + 1} / ${queue.length}` : ''].filter(Boolean).join(' · ')
+      : (queue.length ? `${articlesCount(queue.length)} ve frontě` : '');
+    document.getElementById('tm-dr-meta').textContent = meta;
+    document.getElementById('tm-dr-title').textContent = active && currentTitle ? currentTitle
+      : queue.length ? 'Fronta je připravena' : 'Fronta je prázdná';
+    document.getElementById('tm-dr-sub').textContent = active ? document.getElementById('tm-pl-sub').textContent
+      : queue.length ? 'Stiskněte Přehrát' : 'Články přidáte v seznamu tlačítkem +';
+    document.getElementById('tm-dr-toggle').disabled = !active && !queue.length;
+    document.getElementById('tm-dr-back').disabled = !speechPlaying;
+    document.getElementById('tm-dr-next').disabled = !(queueActive || queue.length);
+    document.getElementById('tm-dr-stop').disabled = !active;
+  }
+
+  function renderDriveQueue() {
+    const list = document.getElementById('tm-dr-qlist');
+    if (!list) return;
+    const scroll = list.parentNode.scrollTop;
+    list.innerHTML = '';
+    if (!queue.length) {
+      list.innerHTML = '<div class="tm-dr-empty">Fronta je prázdná.<br>Články přidáte v seznamu tlačítkem +.</div>';
+      return;
+    }
+    queue.forEach((item, i) => {
+      const row = document.createElement('div');
+      row.className = 'tm-dr-qrow' + (queueActive && i === queueIndex ? ' is-current' : '');
+      const play = document.createElement('button');
+      play.type = 'button';
+      play.className = 'tm-dr-qplay';
+      play.innerHTML = `<span class="tm-dr-qnum">${i + 1}</span><span class="tm-dr-qtitle">${escapeHTML(item.title)}</span>`;
+      play.addEventListener('click', () => { playArticle(item.url, item.title, i); showDriveQueue(false); });
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'tm-dr-qdel';
+      del.innerHTML = icon('trash');
+      del.setAttribute('aria-label', 'Odebrat z fronty');
+      del.addEventListener('click', () => queueRemove(i));
+      row.appendChild(play);
+      row.appendChild(del);
+      list.appendChild(row);
+    });
+    list.parentNode.scrollTop = scroll;
+  }
+
+  // ===========================
+  // MEDIA SESSION: controls in the notification shade / lock screen / car (Bluetooth)
+  // ===========================
+  // The browser voice is not a media element, so Android shows no media notification and may
+  // treat the page as idle. A looping, practically inaudible clip (~ -63 dB noise) fixes both.
+  let keepAlive = null;
+  let keepAlivePauseTimer = 0;
+  let msTitle = null;
+
+  function keepAliveAudio() {
+    if (keepAlive) return keepAlive;
+    const rate = 8000, n = rate * 6;                  // 6 s: very short clips get no media controls
+    const buf = new ArrayBuffer(44 + n * 2);
+    const v = new DataView(buf);
+    const str = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+    str(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    str(36, 'data'); v.setUint32(40, n * 2, true);
+    for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, Math.round((Math.random() * 2 - 1) * 24), true);
+    keepAlive = new Audio(URL.createObjectURL(new Blob([buf], { type: 'audio/wav' })));
+    keepAlive.loop = true;
+    return keepAlive;
+  }
+
+  function mediaSync() {
+    if (!mediaSessionReady) return;
+    const active = speechPlaying || !!busyUrl;
+    const running = active && !ttsPaused;
+    if (running) {
+      clearTimeout(keepAlivePauseTimer); keepAlivePauseTimer = 0;
+      const a = keepAliveAudio();
+      if (a.paused) a.play().catch(() => {});
+    } else if (keepAlive && !keepAlive.paused && !keepAlivePauseTimer) {
+      // short delay: between two queued articles playback is briefly inactive
+      keepAlivePauseTimer = setTimeout(() => {
+        keepAlivePauseTimer = 0;
+        if (!(speechPlaying || busyUrl) || ttsPaused) keepAlive.pause();
+      }, ttsPaused ? 0 : 1500);
+    }
+    const ms = navigator.mediaSession;
+    if (!ms) return;
+    try {
+      ms.playbackState = !active ? 'none' : ttsPaused ? 'paused' : 'playing';
+      const title = active ? (currentTitle || 'Článek') : '';
+      const album = queueActive ? `Fronta ${queueIndex + 1} / ${queue.length}` : 'Čtečka zpráv';
+      const key = title + '|' + album;
+      if (key !== msTitle) {
+        msTitle = key;
+        ms.metadata = title && typeof MediaMetadata === 'function'
+          ? new MediaMetadata({ title, artist: sourceForUrl(currentSpeechUrl).name, album })
+          : null;
+      }
+    } catch { /* not supported */ }
+  }
+
+  let mediaSessionReady = false;
+  function setupMediaSession() {
+    const ms = navigator.mediaSession;
+    if (!ms || mediaSessionReady) return;
+    mediaSessionReady = true;
+    const on = (action, fn) => { try { ms.setActionHandler(action, fn); } catch { /* unsupported action */ } };
+    on('play', () => { if (speechPlaying) { if (ttsPaused) resumeSpeech(); } else if (!busyUrl) playQueue(); });
+    on('pause', () => pauseSpeech());
+    on('stop', () => stopAll());
+    on('nexttrack', () => playNext());
+    on('previoustrack', () => seekBySentences(-REWIND_SENTENCES));   // ⏮ = rewind a bit
+    on('seekbackward', () => seekBySentences(-REWIND_SENTENCES));
+    on('seekforward', () => seekBySentences(REWIND_SENTENCES));
   }
 
   function playNext() {
@@ -981,12 +1240,13 @@
     }
     if (e.key === 'Escape') {
       if (overlay.classList.contains('tm-sheet-open')) closeSheet();
+      else if (driveOpen) driveQueueOpen ? showDriveQueue(false) : closeDrive();
       else if (overlay.classList.contains('tm-mode-detail')) showArticleList();
       else return;
     } else if (e.key === ' ' && !(t && t.tagName === 'BUTTON')) {
       const articleBtn = document.getElementById('tm-speech-btn');
       if (speechPlaying) toggleSpeechUnified('');
-      else if (articleBtn) articleBtn.click();
+      else if (articleBtn && !driveOpen) articleBtn.click();
       else if (!busyUrl) playQueue();
     } else if (e.key === 'n' || e.key === 'N') {
       playNext();
@@ -1380,6 +1640,7 @@
       el.hidden = !queue.length;
     });
     updateSeekUI();
+    updateDriveUI();
   }
 
   function updateSeekUI() {
@@ -1392,6 +1653,10 @@
     seek.value = String(Math.round(frac * 1000));
     seek.style.setProperty('--tm-fill', frac * 100 + '%');
     document.getElementById('tm-pl-pos').textContent = Math.round(frac * 100) + ' %';
+    const bar = document.getElementById('tm-dr-bar');
+    if (bar) bar.style.width = frac * 100 + '%';
+    const pos = document.getElementById('tm-dr-pos');
+    if (pos) pos.textContent = Math.round(frac * 100) + ' %';
   }
 
   function showQueueView() {
@@ -1406,6 +1671,7 @@
 
   function refreshQueueView() {
     if (queueViewOpen) renderQueueView();
+    if (driveOpen && driveQueueOpen) renderDriveQueue();
   }
 
   function renderQueueView() {
@@ -1842,8 +2108,8 @@
     #tm-player {
       flex: none; position: relative; z-index: 2;
       display: grid; align-items: center; gap: 6px 16px;
-      grid-template-columns: auto minmax(0, 1.2fr) minmax(140px, 2fr) auto auto auto;
-      grid-template-areas: "controls info seek pos rate queue";
+      grid-template-columns: auto minmax(0, 1.2fr) minmax(140px, 2fr) auto auto auto auto;
+      grid-template-areas: "controls info seek pos rate queue drive";
       padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
       background: var(--tm-surface); border-top: 1px solid var(--tm-border);
       box-shadow: 0 -6px 20px rgba(16,18,24,.06);
@@ -1866,6 +2132,7 @@
     #tm-pl-pos { grid-area: pos; min-width: 3.2em; text-align: right; font-size: 12px; font-weight: 600; color: var(--tm-text-3); font-variant-numeric: tabular-nums; }
     #tm-pl-rate { grid-area: rate; }
     #tm-pl-queue { grid-area: queue; }
+    #tm-pl-drive { grid-area: drive; }
 
     /* --- settings panel (popover on desktop, bottom sheet on phones) --- */
     #tm-sheet-backdrop {
@@ -1920,6 +2187,83 @@
     .tm-hint code { font-size: 12px; padding: 1px 4px; border-radius: 4px; background: var(--tm-surface-2); }
     .tm-hint kbd { font: 600 11px/1 var(--tm-sans); padding: 3px 6px; border: 1px solid var(--tm-border); border-bottom-width: 2px; border-radius: 5px; background: var(--tm-surface); color: var(--tm-text-2); }
 
+
+    /* --- drive mode: huge targets, high contrast, always dark --- */
+    #tm-drive {
+      --tm-dr-bg: #0b0c0e; --tm-dr-surface: #1b1d21; --tm-dr-surface-2: #26292e; --tm-dr-text: #f3f4f6; --tm-dr-muted: #9ca2ac;
+      position: absolute; inset: 0; z-index: 9; display: none; flex-direction: column; gap: 14px;
+      padding: calc(10px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom));
+      background: var(--tm-dr-bg); color: var(--tm-dr-text); overflow: hidden;
+    }
+    #tm-clean-overlay.tm-drive-open #tm-drive { display: flex; }
+    .tm-dr-top { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .tm-dr-pill {
+      --tm-ic: 24px; display: inline-flex; align-items: center; gap: 8px; height: 56px; padding: 0 18px;
+      border: 0; border-radius: 16px; background: var(--tm-dr-surface); color: var(--tm-dr-text);
+      font-size: 17px; font-weight: 650; cursor: pointer;
+    }
+    .tm-dr-heading { font-size: 13px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--tm-dr-muted); }
+    .tm-dr-player {
+      flex: 1 1 auto; min-height: 0; width: 100%; max-width: 980px; margin: 0 auto;
+      display: grid; gap: 14px; grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) auto auto;
+      grid-template-areas: "now" "ctrl" "bottom";
+    }
+    .tm-dr-now { grid-area: now; min-height: 0; display: flex; flex-direction: column; justify-content: center; gap: 10px; overflow: hidden; }
+    .tm-dr-meta { font-size: 14px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #ff5a6e; }
+    .tm-dr-title {
+      font-size: clamp(22px, 6.6vw, 34px); font-weight: 750; line-height: 1.22; overflow-wrap: anywhere;
+      display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden;
+    }
+    .tm-dr-sub { font-size: 16px; color: var(--tm-dr-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tm-dr-progress { display: flex; align-items: center; gap: 12px; margin-top: 6px; }
+    .tm-dr-track { flex: 1 1 auto; height: 10px; border-radius: 5px; background: var(--tm-dr-surface-2); overflow: hidden; }
+    .tm-dr-track span { display: block; height: 100%; width: 0; background: #e8324a; border-radius: 5px; }
+    #tm-dr-pos { flex: none; min-width: 3.4em; text-align: right; font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--tm-dr-muted); }
+    .tm-dr-controls { grid-area: ctrl; display: grid; grid-template-columns: 1fr 1.4fr 1fr; gap: 14px; }
+    .tm-dr-btn {
+      --tm-ic: 46px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+      min-height: clamp(116px, 21vh, 180px); padding: 10px 6px; border: 0; border-radius: 26px;
+      background: var(--tm-dr-surface); color: var(--tm-dr-text); font-size: 18px; font-weight: 700; cursor: pointer;
+      transition: transform .08s ease, background .15s ease;
+    }
+    .tm-dr-btn:active:not(:disabled) { transform: scale(.96); background: var(--tm-dr-surface-2); }
+    .tm-dr-main { --tm-ic: 68px; background: #d4162f; color: #fff; font-size: 20px; box-shadow: 0 10px 30px rgba(212,22,47,.35); }
+    .tm-dr-main:active:not(:disabled) { background: #b5112a; }
+    .tm-dr-ic { display: grid; place-items: center; min-height: var(--tm-ic); }
+    .tm-dr-ic .tm-spinner { width: 46px; height: 46px; border-width: 5px; }
+    .tm-dr-bottom { grid-area: bottom; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .tm-dr-wide {
+      --tm-ic: 28px; display: flex; align-items: center; justify-content: center; gap: 12px;
+      height: clamp(68px, 11vh, 90px); border: 0; border-radius: 22px; background: var(--tm-dr-surface); color: var(--tm-dr-text);
+      font-size: 20px; font-weight: 700; cursor: pointer;
+    }
+    .tm-dr-wide:active:not(:disabled) { background: var(--tm-dr-surface-2); }
+    .tm-dr-count { min-width: 30px; height: 30px; padding: 0 8px; border-radius: 15px; background: #d4162f; color: #fff; font-size: 16px; line-height: 30px; text-align: center; }
+    #tm-drive button:disabled { opacity: .32; }
+    .tm-dr-queue { display: none; flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; width: 100%; max-width: 980px; margin: 0 auto; }
+    #tm-drive.tm-dr-q .tm-dr-player { display: none; }
+    #tm-drive.tm-dr-q .tm-dr-queue { display: block; }
+    .tm-dr-qlist { display: flex; flex-direction: column; gap: 12px; padding-bottom: 8px; }
+    .tm-dr-qrow { display: flex; gap: 12px; }
+    .tm-dr-qplay {
+      flex: 1 1 auto; min-width: 0; min-height: 88px; display: flex; align-items: center; gap: 16px; padding: 14px 18px;
+      border: 0; border-radius: 20px; background: var(--tm-dr-surface); color: var(--tm-dr-text); text-align: left; cursor: pointer;
+    }
+    .tm-dr-qnum { flex: none; min-width: 1.3em; font-size: 26px; font-weight: 800; color: #ff5a6e; font-variant-numeric: tabular-nums; }
+    .tm-dr-qtitle { font-size: 19px; font-weight: 650; line-height: 1.3; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+    .tm-dr-qrow.is-current .tm-dr-qplay { background: #3a1219; box-shadow: inset 0 0 0 3px #e8324a; }
+    .tm-dr-qdel { --tm-ic: 30px; flex: none; width: 88px; display: grid; place-items: center; border: 0; border-radius: 20px; background: var(--tm-dr-surface); color: #ff8a98; cursor: pointer; }
+    .tm-dr-empty { padding: 56px 16px; text-align: center; font-size: 20px; line-height: 1.5; color: var(--tm-dr-muted); }
+    @media (orientation: landscape) and (max-height: 620px) {
+      #tm-drive { gap: 10px; padding-top: calc(8px + env(safe-area-inset-top)); padding-left: calc(16px + env(safe-area-inset-left)); padding-right: calc(16px + env(safe-area-inset-right)); }
+      .tm-dr-pill { height: 48px; }
+      .tm-dr-player { grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); grid-template-rows: minmax(0, 1fr) auto; grid-template-areas: "now ctrl" "now bottom"; column-gap: 20px; }
+      .tm-dr-title { font-size: clamp(20px, 3.4vw, 30px); -webkit-line-clamp: 3; }
+      .tm-dr-controls { align-self: stretch; }
+      .tm-dr-btn { min-height: 0; height: 100%; }
+      .tm-dr-wide { height: clamp(56px, 17vh, 76px); }
+    }
+
     /* ======= tablets & phones ======= */
     @media (max-width: 899px) {
       #tm-clean-overlay { --tm-fs-base: 18px; }
@@ -1969,8 +2313,8 @@
       .tm-reader-actions .tm-btn-ghost span { display: none; }
 
       #tm-player {
-        grid-template-columns: minmax(0, 1fr) auto auto;
-        grid-template-areas: "seek seek pos" "info controls queue";
+        grid-template-columns: minmax(0, 1fr) auto auto auto;
+        grid-template-areas: "seek seek seek pos" "info controls queue drive";
         gap: 2px 6px; padding: 4px 10px calc(8px + env(safe-area-inset-bottom)) 14px;
       }
       #tm-pl-rate { display: none; }
@@ -1993,7 +2337,7 @@
     }
     @media (max-width: 380px) {
       .tm-src-btn { font-size: 12.5px; }
-      #tm-hd-queue { display: none; }
+      #tm-hd-queue, #tm-pl-stop { display: none; }
     }
     @media (hover: none) {
       .tm-article-row:hover, .tm-queue-row:hover { background: transparent; }
