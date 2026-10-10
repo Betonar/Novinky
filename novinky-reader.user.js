@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Novinky.cz + iDNES.cz - Clean Reader + Neural TTS
 // @namespace    http://tampermonkey.net/
-// @version      5.2
+// @version      5.3
 // @description  Multi-source (Novinky.cz, iDNES.cz, Aktuálně.cz; launcher at https://example.com/) category browser, clean article reader and high-quality Czech neural TTS (Azure) with local fallback.
 // @author       You
 // @match        *://*.novinky.cz/*
@@ -919,7 +919,7 @@
             <div id="tm-dr-meta" class="tm-dr-meta"></div>
             <div id="tm-dr-title" class="tm-dr-title"></div>
             <div id="tm-dr-sub" class="tm-dr-sub"></div>
-            <div class="tm-dr-progress"><div class="tm-dr-track"><span id="tm-dr-bar"></span></div><span id="tm-dr-pos">0 %</span></div>
+            <div class="tm-dr-progress"><input id="tm-dr-seek" class="tm-range tm-dr-range" type="range" min="0" max="1000" value="0" step="1" disabled aria-label="Posun v článku"><span id="tm-dr-pos">0 %</span></div>
           </div>
           <div class="tm-dr-controls">
             <button id="tm-dr-back" class="tm-dr-btn" type="button"><span class="tm-dr-ic">${icon('rewind')}</span><span class="tm-dr-lbl">Zpět</span></button>
@@ -968,6 +968,7 @@
           <div id="tm-usage-label"></div>
           <div class="tm-meter"><span id="tm-usage-bar"></span></div>
         </div>
+        <p id="tm-ms-status" class="tm-hint" hidden></p>
         <p class="tm-hint">Azure klíč: menu Tampermonkey → „Nastavit Azure klíč a region“. Hlas Piper potřebuje spuštěný <code>start-piper.bat</code>.</p>
         <p class="tm-hint tm-kbd-hint"><kbd>Mezerník</kbd> přehrát / pauza · <kbd>N</kbd> další · <kbd>Esc</kbd> zpět</p>
       </section>
@@ -1015,15 +1016,18 @@
     overlay.querySelector('#tm-dr-stop').addEventListener('click', stopAll);
     overlay.querySelector('#tm-dr-queue').addEventListener('click', () => showDriveQueue(true));
     document.addEventListener('visibilitychange', requestWakeLock);
-    const seek = overlay.querySelector('#tm-pl-seek');
-    seek.addEventListener('input', () => {
-      seekDragging = true;
-      seek.style.setProperty('--tm-fill', seek.value / 10 + '%');
-      overlay.querySelector('#tm-pl-pos').textContent = Math.round(seek.value / 10) + ' %';
-    });
-    seek.addEventListener('change', () => {
-      seekDragging = false;
-      seekToFraction(seek.value / 1000);
+    // position sliders (player bar + drive mode): jump on release
+    [['#tm-pl-seek', '#tm-pl-pos'], ['#tm-dr-seek', '#tm-dr-pos']].forEach(([sel, posSel]) => {
+      const seek = overlay.querySelector(sel);
+      seek.addEventListener('input', () => {
+        seekDragging = true;
+        seek.style.setProperty('--tm-fill', seek.value / 10 + '%');
+        overlay.querySelector(posSel).textContent = Math.round(seek.value / 10) + ' %';
+      });
+      seek.addEventListener('change', () => {
+        seekDragging = false;
+        seekToFraction(seek.value / 1000);
+      });
     });
 
     bindSettings();
@@ -1172,9 +1176,30 @@
     v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
     str(36, 'data'); v.setUint32(40, n * 2, true);
     for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, Math.round((Math.random() * 2 - 1) * 24), true);
-    keepAlive = new Audio(URL.createObjectURL(new Blob([buf], { type: 'audio/wav' })));
+    // data: URL, not blob: — a blob made inside the userscript sandbox may not be loadable by the page
+    const bytes = new Uint8Array(buf);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    keepAlive = document.createElement('audio');
     keepAlive.loop = true;
+    keepAlive.preload = 'auto';
+    keepAlive.setAttribute('aria-hidden', 'true');
+    keepAlive.style.display = 'none';
+    keepAlive.addEventListener('playing', () => setMediaStatus('ok'));
+    keepAlive.addEventListener('error', () => setMediaStatus('error', 'nelze načíst zvuk'));
+    keepAlive.src = 'data:audio/wav;base64,' + btoa(bin);
+    (document.getElementById('tm-clean-overlay') || document.body).appendChild(keepAlive);
     return keepAlive;
+  }
+
+  // Shown in settings so it can be checked on the phone whether the notification controls can work.
+  let mediaStatus = '';
+  function setMediaStatus(kind, detail = '') {
+    mediaStatus = !navigator.mediaSession ? 'Ovládání z lišty oznámení: prohlížeč nepodporuje'
+      : kind === 'ok' ? 'Ovládání z lišty oznámení: aktivní (pokud se nezobrazí, prohlížeč ho pro tento zvuk nenabízí)'
+      : `Ovládání z lišty oznámení: nefunguje – ${detail}`;
+    const el = document.getElementById('tm-ms-status');
+    if (el) { el.textContent = mediaStatus; el.hidden = false; }
   }
 
   function mediaSync() {
@@ -1184,7 +1209,7 @@
     if (running) {
       clearTimeout(keepAlivePauseTimer); keepAlivePauseTimer = 0;
       const a = keepAliveAudio();
-      if (a.paused) a.play().catch(() => {});
+      if (a.paused) a.play().catch(err => setMediaStatus('error', (err && err.name) || String(err)));
     } else if (keepAlive && !keepAlive.paused && !keepAlivePauseTimer) {
       // short delay: between two queued articles playback is briefly inactive
       keepAlivePauseTimer = setTimeout(() => {
@@ -1644,19 +1669,17 @@
   }
 
   function updateSeekUI() {
-    const seek = document.getElementById('tm-pl-seek');
-    if (!seek) return;
     const enabled = speechSentences.length > 0 && (speechPlaying || !!busyUrl);
-    seek.disabled = !enabled;
-    if (seekDragging) return;
     const frac = enabled ? speechPos / speechTotalChars : 0;
-    seek.value = String(Math.round(frac * 1000));
-    seek.style.setProperty('--tm-fill', frac * 100 + '%');
-    document.getElementById('tm-pl-pos').textContent = Math.round(frac * 100) + ' %';
-    const bar = document.getElementById('tm-dr-bar');
-    if (bar) bar.style.width = frac * 100 + '%';
-    const pos = document.getElementById('tm-dr-pos');
-    if (pos) pos.textContent = Math.round(frac * 100) + ' %';
+    [['tm-pl-seek', 'tm-pl-pos'], ['tm-dr-seek', 'tm-dr-pos']].forEach(([id, posId]) => {
+      const seek = document.getElementById(id);
+      if (!seek) return;
+      seek.disabled = !enabled;
+      if (seekDragging) return;
+      seek.value = String(Math.round(frac * 1000));
+      seek.style.setProperty('--tm-fill', frac * 100 + '%');
+      document.getElementById(posId).textContent = Math.round(frac * 100) + ' %';
+    });
   }
 
   function showQueueView() {
@@ -2216,8 +2239,14 @@
     }
     .tm-dr-sub { font-size: 16px; color: var(--tm-dr-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .tm-dr-progress { display: flex; align-items: center; gap: 12px; margin-top: 6px; }
-    .tm-dr-track { flex: 1 1 auto; height: 10px; border-radius: 5px; background: var(--tm-dr-surface-2); overflow: hidden; }
-    .tm-dr-track span { display: block; height: 100%; width: 0; background: #e8324a; border-radius: 5px; }
+    /* big touch target: 48px tall, thick track, 34px thumb */
+    .tm-dr-range { flex: 1 1 auto; height: 48px; --tm-track: #2c2f35; --tm-surface: #0b0c0e; --tm-accent: #e8324a; }
+    .tm-dr-range::-webkit-slider-runnable-track { height: 12px; border-radius: 6px; }
+    .tm-dr-range::-webkit-slider-thumb { width: 34px; height: 34px; margin-top: -11px; }
+    .tm-dr-range::-moz-range-track { height: 12px; border-radius: 6px; }
+    .tm-dr-range::-moz-range-progress { height: 12px; border-radius: 6px; }
+    .tm-dr-range::-moz-range-thumb { width: 34px; height: 34px; }
+    .tm-dr-range:disabled { opacity: .35; }
     #tm-dr-pos { flex: none; min-width: 3.4em; text-align: right; font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--tm-dr-muted); }
     .tm-dr-controls { grid-area: ctrl; display: grid; grid-template-columns: 1fr 1.4fr 1fr; gap: 14px; }
     .tm-dr-btn {
