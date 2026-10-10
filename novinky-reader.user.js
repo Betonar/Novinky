@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Novinky.cz + iDNES.cz - Clean Reader + Neural TTS
 // @namespace    http://tampermonkey.net/
-// @version      5.3
+// @version      5.4
 // @description  Multi-source (Novinky.cz, iDNES.cz, Aktuálně.cz; launcher at https://example.com/) category browser, clean article reader and high-quality Czech neural TTS (Azure) with local fallback.
 // @author       You
 // @match        *://*.novinky.cz/*
@@ -386,7 +386,9 @@
 
   const CONSENT_RE = /nastaveni-souhlasu/i;
   function consentError(src) {
-    return new Error(`${src.name} vyžaduje souhlas s cookies. Otevřete ${src.origin} v prohlížeči, klikněte „Souhlasím“ a zkuste to znovu.`);
+    const e = new Error(`${src.name} vyžaduje souhlas s cookies. Otevřete ${src.origin} v prohlížeči, klikněte „Souhlasím“ a zkuste to znovu.`);
+    e.consent = true;
+    return e;
   }
 
   // Same origin: plain fetch (as before). Other site: GM_xmlhttpRequest (cross-origin, cookies of that site).
@@ -395,7 +397,7 @@
     let buf, contentType, finalUrl;
     if (new URL(url, location.href).origin === location.origin) {
       const response = await fetch(url, { credentials: 'same-origin', cache: 'no-cache' });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status} – ${url}`);
       buf = await response.arrayBuffer();
       contentType = response.headers.get('content-type');
       finalUrl = response.url;
@@ -407,11 +409,11 @@
           responseType: 'arraybuffer',
           timeout: 30000,
           onload: resolve,
-          onerror: () => reject(new Error(`${src.name}: síťová chyba / blokováno (povolte připojení v Tampermonkey)`)),
-          ontimeout: () => reject(new Error(`${src.name}: timeout`))
+          onerror: e => reject(new Error(`${src.name}: síťová chyba / blokováno (povolte připojení v Tampermonkey) – ${url}${e && e.error ? ' – ' + e.error : ''}`)),
+          ontimeout: () => reject(new Error(`${src.name}: timeout – ${url}`))
         });
       });
-      if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status}`);
+      if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status} – ${r.finalUrl || url}`);
       buf = r.response;
       contentType = (/content-type:\s*([^\r\n]+)/i.exec(r.responseHeaders || '') || [])[1];
       finalUrl = r.finalUrl || url;
@@ -1421,15 +1423,9 @@
     content.scrollTop = 0;
     const src = currentSource;
     try {
-      let docToParse;
-      if (src === SOURCES.novinky && path === '/' && window.location.pathname === '/' && findSource(location.href) === src) {
-        docToParse = document;
-      } else {
-        docToParse = await fetchDocument(/^https?:/i.test(path) ? path : sourceOrigin(src) + path);
-      }
+      const { articles, notice } = await fetchCategoryArticles(src, path);
       if (src !== currentSource || path !== currentCategoryPath || queueViewOpen || viewedArticleUrl) return;   // user moved on
-      const articles = extractArticles(docToParse, src);
-      renderArticles(articles, content);
+      renderArticles(articles, content, notice);
     } catch (error) {
       if (src !== currentSource || path !== currentCategoryPath) return;
       content.innerHTML = stateHTML('error', 'Články se nepodařilo načíst', error.message, 'Zkusit znovu');
@@ -1437,7 +1433,47 @@
     }
   }
 
-  function renderArticles(articles, container) {
+  const categoryUrl = (src, path) => /^https?:/i.test(path) ? path : sourceOrigin(src) + path;
+  // "idnes.cz/zpravy/domaci/" – host without www + path with a trailing slash, for prefix matching
+  const urlPrefix = u => {
+    try { const x = new URL(u); return x.hostname.replace(/^www\./, '') + x.pathname.replace(/\/?$/, '/'); } catch { return String(u); }
+  };
+
+  // Section page, then the same URL with a trailing slash. If the section itself cannot be loaded,
+  // fall back to the articles of that section listed on the front page (their URLs contain the section path).
+  async function fetchCategoryArticles(src, path) {
+    if (src === SOURCES.novinky && path === '/' && window.location.pathname === '/' && findSource(location.href) === src) {
+      return { articles: extractArticles(document, src) };
+    }
+    const url = categoryUrl(src, path);
+    const tries = /\/$/.test(url) ? [url] : [url, url + '/'];
+    let lastErr = null;
+    for (const u of tries) {
+      try {
+        const articles = extractArticles(await fetchDocument(u), src);
+        if (articles.length || u === tries[tries.length - 1]) return { articles };
+      } catch (e) {
+        if (e.consent) throw e;
+        lastErr = e;
+      }
+    }
+    const homeUrl = categoryUrl(src, Object.values(src.categories)[0]);
+    if (urlPrefix(homeUrl) !== urlPrefix(url)) {
+      try {
+        const prefix = urlPrefix(url);
+        const articles = extractArticles(await fetchDocument(homeUrl), src).filter(a => urlPrefix(a.url).startsWith(prefix));
+        if (articles.length) {
+          return { articles, notice: `Rubriku se nepodařilo načíst${lastErr ? ` (${lastErr.message})` : ''}. Zobrazuji její články z titulní stránky.` };
+        }
+      } catch (e) {
+        if (e.consent) throw e;
+      }
+    }
+    if (lastErr) throw lastErr;
+    return { articles: [] };
+  }
+
+  function renderArticles(articles, container, notice = '') {
     container.innerHTML = '';
     if (!articles.length) {
       container.innerHTML = stateHTML('empty', 'Nenalezeny žádné články', 'Zkuste jinou rubriku.');
@@ -1445,7 +1481,8 @@
     }
     const page = document.createElement('div');
     page.className = 'tm-page';
-    page.innerHTML = `<div class="tm-list-meta"><span>${articlesCount(articles.length)}</span><span class="tm-list-hint">${icon('play')} přečíst · ${icon('plus')} do fronty</span></div>`;
+    page.innerHTML = (notice ? `<div class="tm-notice">${icon('alert')}<span>${escapeHTML(notice)}</span></div>` : '') +
+      `<div class="tm-list-meta"><span>${articlesCount(articles.length)}</span><span class="tm-list-hint">${icon('play')} přečíst · ${icon('plus')} do fronty</span></div>`;
 
     const list = document.createElement('ol');
     list.id = 'tm-article-list';
@@ -2100,6 +2137,10 @@
     .tm-state-title { font-size: 18px; font-weight: 700; }
     .tm-state-text { max-width: 460px; color: var(--tm-text-2); font-size: 14.5px; overflow-wrap: anywhere; }
     .tm-state-action { margin-top: 8px; }
+    .tm-notice {
+      --tm-ic: 18px; display: flex; align-items: flex-start; gap: 10px; margin: 0 0 12px; padding: 10px 12px;
+      border-radius: 10px; background: var(--tm-surface-2); color: var(--tm-warn); font-size: 13.5px; line-height: 1.45; overflow-wrap: anywhere;
+    }
     .tm-error { color: var(--tm-accent); background: var(--tm-accent-soft); padding: 14px 16px; border-radius: 10px; }
 
     @keyframes tm-shimmer { 0% { opacity: .55; } 50% { opacity: 1; } 100% { opacity: .55; } }
